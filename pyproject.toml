@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfbd3"
+version = "0.1.0"
+description = "Video restyling with diffusion: chunked video-model generation and per-frame motion-compensated feedback"
+authors = [{ name = "Victor Condino" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+	"torch",
+	"torchvision",
+	"diffusers>=0.35",
+	"transformers",
+	"accelerate",
+	"sentencepiece",
+	"protobuf",
+	"ftfy",
+	"peft",
+	"opencv-python-headless",
+	"pillow",
+	"numpy",
+	"click",
+	"tqdm",
+]
+
+[project.optional-dependencies]
+upscale = ["spandrel"]
+dev = ["pytest", "nbformat"]
+
+[project.scripts]
+vfbd3 = "vfbd3.cli:main"
+
+[tool.setuptools]
+packages = ["vfbd3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: downloads models or runs a tiny diffusion pipeline on CPU"]
