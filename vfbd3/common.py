@@ -39,6 +39,18 @@ def free_memory():
 		torch.cuda.empty_cache()
 
 
+def apply_preset(cfg, presets, defaults):
+	''' fill the config fields left at None from the `fast` preset, then from `defaults`.
+	A preset's LoRA goes in front of the user's own. '''
+	if cfg.fast and cfg.fast not in presets:
+		raise ValueError(f"unknown fast preset {cfg.fast!r}; choices: {', '.join(sorted(presets))}")
+	preset = presets.get(cfg.fast, {})
+	for key, value in {**defaults, **preset}.items():
+		if hasattr(cfg, key) and getattr(cfg, key) is None:
+			setattr(cfg, key, value)
+	cfg.lora = [*([preset["lora"]] if "lora" in preset else []), *cfg.lora]
+
+
 def load_loras(pipe, specs):
 	''' each spec is "repo_or_path[:weight_file][@scale]". '''
 	names, scales = [], []

@@ -13,9 +13,10 @@ def shared_options(fn):
 		click.option("--negative-prompt", default=None, help="what to steer away from"),
 		click.option("--control", default="depth", show_default=True, help="structure signal taken from the input: depth, canny (vace also: gray, none)"),
 		click.option("--control-scale", type=float, default=1.0, show_default=True, help="how strongly the control signal is followed"),
+		click.option("--fast", default=None, help="few-step preset, which sets steps and guidance unless given. vace: causvid, selfforcing. frame: lcm, lightning, dmd2, turbo"),
 		click.option("--steps", type=int, default=None, help="denoising steps"),
 		click.option("--guidance", type=float, default=None, help="prompt guidance scale"),
-		click.option("--seed", type=int, default=None),
+		click.option("--seed", type=int, default=None, help="seed for the starting noise"),
 		click.option("--color-fix", type=float, default=0.0, show_default=True, help="0..1, pull output colours back toward the first output to stop drift"),
 		click.option("--lora", multiple=True, help="LoRA to load, as repo_or_path[:weight_file][@scale]; repeatable"),
 		click.option("--start", type=float, default=None, help="start time in seconds"),
@@ -68,7 +69,10 @@ def vace(input_video, output_video, **options):
 @click.option("--motion-estimator", default=None, help="dis (default), farneback, raft, raft_small")
 @click.option("--motion-alpha", type=float, default=None, help="temporal smoothing of the motion field, 0..1")
 @click.option("--motion-sigma", type=float, default=None, help="spatial smoothing of the motion field, in pixels")
-@click.option("--occlusion/--no-occlusion", default=None, help="fill newly revealed areas from the input instead of smearing the previous output into them")
+@click.option("--occlusion/--no-occlusion", default=None, help="re-generate newly revealed areas instead of smearing the previous output into them (default on)")
+@click.option("--occlusion-denoise", type=float, default=None, help="0..1, denoise used inside newly revealed areas (default 1.0); the rest of the frame keeps --denoise")
+@click.option("--noise", default=None, help="starting noise: warp (default, one noise field carried along the motion), fixed (same every frame), random (new every frame)")
+@click.option("--tiny-vae", is_flag=True, default=None, help="use the tiny SDXL autoencoder: much faster encode and decode, slightly softer detail")
 @click.option("--ip-adapter", type=float, default=None, help="> 0: also condition on the warped previous output as an image prompt, at this scale")
 @click.option("--input-filter", default=None, help="filter chain applied to each input frame (see `vfbd3 filters`)")
 @click.option("--feedback-filter", default=None, help="filter chain applied to the motion-compensated previous output")
@@ -77,6 +81,7 @@ def vace(input_video, output_video, **options):
 def frame(input_video, output_video, **options):
 	''' Per-frame img2img with motion-compensated feedback (the controlnetvideo technique). '''
 	from . import frame as engine
+	options["lora"] = list(options["lora"])
 	engine.run(input_video, output_video, _config(engine.FrameConfig, options))
 
 

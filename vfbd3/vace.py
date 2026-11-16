@@ -28,6 +28,17 @@ DEFAULT_NEGATIVE = (
 	"misshapen limbs, fused fingers, messy background")
 
 
+DEFAULTS = dict(steps=30, guidance=5.0, flow_shift=3.0)
+
+# step-distillation LoRAs for the Wan 2.1 1.3B model: a handful of steps, no classifier-free guidance
+FAST = {
+	"causvid": dict(steps=8, guidance=1.0, flow_shift=8.0,
+		lora="Kijai/WanVideo_comfy:Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors"),
+	"selfforcing": dict(steps=4, guidance=1.0, flow_shift=5.0,
+		lora="Kijai/WanVideo_comfy:LoRAs/Wan2_1_self_forcing_1_3B/Wan2_1_self_forcing_dmd_1_3B_lora_rank_32_fp16.safetensors"),
+}
+
+
 @dataclass
 class VaceConfig:
 	prompt: str
@@ -39,9 +50,10 @@ class VaceConfig:
 	fps: float = 16.0              # Wan generates 16 fps motion; input is resampled to this
 	chunk_frames: int = 81         # must be 4k+1
 	overlap: int = 9               # 4k+1 lines up with the VAE's temporal blocks
-	steps: int = 30
-	guidance: float = 5.0
-	flow_shift: float = 3.0        # 3 for 480p, 5 for 720p
+	fast: str | None = None        # a FAST preset; sets steps, guidance and flow_shift unless given
+	steps: int | None = None       # default 30
+	guidance: float | None = None  # default 5.0
+	flow_shift: float | None = None  # default 3 (480p); 5 suits 720p
 	seed: int | None = None
 	anchor: str = "first"          # "first" (first output frame), "none", or an image path
 	warp_frames: int = 0
@@ -55,6 +67,7 @@ class VaceConfig:
 	restart: bool = False
 
 	def __post_init__(self):
+		common.apply_preset(self, FAST, DEFAULTS)
 		if (self.chunk_frames - 1) % 4 or self.chunk_frames < 5:
 			raise ValueError(f"chunk_frames must be 4k+1 (5, 9, ..., 81), got {self.chunk_frames}")
 		if not 0 <= self.overlap < self.chunk_frames:

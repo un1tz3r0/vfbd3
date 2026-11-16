@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
-from vfbd3 import control, motion, video
+from vfbd3 import control, frame, motion, vace, video
 from vfbd3.vace import iter_chunks, padded_length
 
 
@@ -103,3 +103,36 @@ def test_controls_and_color_match():
 	fixed = control.match_color(tinted, frame, 1.0)
 	assert np.abs(fixed.mean((0, 1)) - frame.mean((0, 1))).max() < np.abs(tinted.mean((0, 1)) - frame.mean((0, 1))).max() / 3
 	assert np.array_equal(control.match_color(tinted, frame, 0.0), tinted)
+
+
+def test_noise_field_moves_with_the_flow_and_stays_white():
+	field = motion.NoiseField(64, 96, seed=0)
+	before = field.field.copy()
+	flow = np.zeros((64, 96, 2), np.float32)
+	flow[..., 0] = -5           # content moves 5 px to the right
+	field.advance(flow)
+	assert np.array_equal(field.field[:, 5:], before[:, :-5])
+	assert not np.array_equal(field.field[:, :5], before[:, :5])        # entered the frame: fresh
+
+	# a zoom maps several pixels onto one source; duplicates must be redrawn, not copied
+	xx, yy = np.meshgrid(np.arange(96, dtype=np.float32), np.arange(64, dtype=np.float32))
+	zoom = np.stack([(xx - 48) * -0.1, (yy - 32) * -0.1], axis=2)
+	for _ in range(20):
+		field.advance(zoom)
+	latent = field.latent()
+	assert latent.shape == (4, 8, 12)
+	assert abs(field.field.std() - 1) < 0.02 and abs(latent.std() - 1) < 0.15
+	rows = field.field[..., 0]
+	assert abs(np.corrcoef(rows[:, :-1].ravel(), rows[:, 1:].ravel())[0, 1]) < 0.05
+
+
+def test_fast_presets_fill_only_unset_fields():
+	assert (frame.FrameConfig(prompt="x").steps, frame.FrameConfig(prompt="x").guidance) == (25, 7.5)
+	cfg = frame.FrameConfig(prompt="x", fast="dmd2", guidance=2.0, lora=["mine"])
+	assert (cfg.steps, cfg.guidance, cfg.lora) == (4, 2.0, [frame.FAST["dmd2"]["lora"], "mine"])
+	assert frame.FrameConfig(prompt="x", fast="turbo").model == "stabilityai/sdxl-turbo"
+	cfg = vace.VaceConfig(prompt="x", fast="selfforcing")
+	assert (cfg.steps, cfg.guidance, cfg.flow_shift, len(cfg.lora)) == (4, 1.0, 5.0, 1)
+	assert vace.VaceConfig(prompt="x").steps == 30
+	with pytest.raises(ValueError):
+		vace.VaceConfig(prompt="x", fast="nope")

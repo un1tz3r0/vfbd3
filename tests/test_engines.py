@@ -9,10 +9,12 @@ class RecordingBackend:
 	records what the frame loop handed it. '''
 
 	def __init__(self):
-		self.calls = []
+		self.calls, self.noise = [], []
 
-	def generate(self, init, control_image, denoise, params, reference=None):
+	def generate(self, init, control_image, denoise, params, reference=None, noise=None, regen=None):
 		self.calls.append(dict(denoise=denoise, has_feedback=reference is not None, shape=init.shape))
+		self.noise.append(noise)
+		assert regen is None or regen.shape == init.shape[:2]
 		return np.clip(init.astype(int) + 10, 0, 255).astype(np.uint8)
 
 
@@ -27,6 +29,8 @@ def test_frame_engine_runs_and_resumes(clip, tmp_path):
 	assert backend.calls[0] == dict(denoise=1.0, has_feedback=False, shape=(48, 64, 3))
 	assert all(c["has_feedback"] and c["denoise"] == 0.5 for i, c in enumerate(backend.calls) if i not in (0, 5))
 	assert backend.calls[5]["denoise"] == 0.3
+	# the noise field is latent sized and moves with the picture rather than being redrawn
+	assert backend.noise[0].shape == (4, 6, 8) and not np.array_equal(backend.noise[0], backend.noise[-1])
 	info = video.probe(out)
 	assert (info.width, info.height) == (64, 48) and info.has_audio
 	assert len(list(video.read_frames(out, (64, 48)))) == 12
@@ -37,6 +41,65 @@ def test_frame_engine_runs_and_resumes(clip, tmp_path):
 	frame.run(clip, out, cfg, backend=more)
 	assert len(more.calls) == 12 and all(c["has_feedback"] for c in more.calls)
 	assert len(list(video.read_frames(out, (64, 48)))) == 24
+
+
+def tiny_sdxl_pipeline():
+	''' a randomly initialised SDXL + ControlNet-Union img2img pipeline small enough for CPU. '''
+	import torch
+	from diffusers import (AutoencoderKL, ControlNetUnionModel, EulerDiscreteScheduler,
+		StableDiffusionXLControlNetUnionImg2ImgPipeline, UNet2DConditionModel)
+	from transformers import CLIPTextConfig, CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+
+	torch.manual_seed(0)
+	shared = dict(block_out_channels=(32, 64), layers_per_block=2, in_channels=4, attention_head_dim=(2, 4),
+		use_linear_projection=True, addition_embed_type="text_time", addition_time_embed_dim=8,
+		transformer_layers_per_block=(1, 2), projection_class_embeddings_input_dim=80, cross_attention_dim=64)
+	unet = UNet2DConditionModel(sample_size=32, out_channels=4, down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
+		up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"), **shared)
+	controlnet = ControlNetUnionModel(down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
+		conditioning_embedding_out_channels=(16, 16, 32, 32), num_trans_channel=32, num_trans_head=2, num_proj_channel=32, **shared)
+	vae = AutoencoderKL(block_out_channels=[32, 32, 64, 64], in_channels=3, out_channels=3, latent_channels=4,
+		down_block_types=["DownEncoderBlock2D"] * 4, up_block_types=["UpDecoderBlock2D"] * 4)
+	text_config = CLIPTextConfig(bos_token_id=0, eos_token_id=2, hidden_size=32, intermediate_size=37, layer_norm_eps=1e-05,
+		num_attention_heads=4, num_hidden_layers=5, pad_token_id=1, vocab_size=1000, hidden_act="gelu", projection_dim=32)
+	tokenizer = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
+	scheduler = EulerDiscreteScheduler(beta_start=0.00085, beta_end=0.012, steps_offset=1, beta_schedule="scaled_linear")
+	return StableDiffusionXLControlNetUnionImg2ImgPipeline(unet=unet, controlnet=controlnet, vae=vae, scheduler=scheduler,
+		text_encoder=CLIPTextModel(text_config), tokenizer=tokenizer,
+		text_encoder_2=CLIPTextModelWithProjection(text_config), tokenizer_2=tokenizer)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fast", [None, "lcm", "lightning", "turbo"])
+def test_sdxl_backend_holds_unmasked_pixels(fast, monkeypatch):
+	from vfbd3 import common
+	monkeypatch.setattr(common, "load_loras", lambda pipe, specs: None)
+	cfg = frame.FrameConfig(prompt="a mural", control="canny", fast=fast, steps=8, seed=3)
+	backend = frame.SDXLUnionBackend(cfg, device="cpu", pipe=tiny_sdxl_pipeline())
+	assert backend.pipe.text_encoder is None and type(backend.pipe.scheduler).__name__ == (
+		frame.FAST[fast]["scheduler"][0] if fast else "EulerDiscreteScheduler")
+
+	rng = np.random.default_rng(0)
+	init = rng.integers(0, 255, (48, 64, 3), dtype=np.uint8)
+	noise = rng.standard_normal((4, 6, 8), dtype=np.float32)
+	seen = []
+	unet = backend.pipe.unet.forward
+	monkeypatch.setattr(backend.pipe.unet, "forward", lambda sample, *a, **k: seen.append(sample[-1:].clone()) or unet(sample, *a, **k))
+
+	# no mask: plain img2img, half of the 8 steps
+	assert backend.generate(init, init, 0.5, {}, noise=noise).shape == (48, 64, 3)
+	assert len(seen) == 4
+	plain_start = seen[0]
+
+	# left half masked: all 8 steps run, and the unmasked half enters the fifth step exactly as
+	# plain img2img at denoise 0.5 would have started it
+	seen.clear()
+	regen = np.zeros((48, 64), np.float32)
+	regen[:, :32] = 1
+	backend.generate(init, init, 0.5, {}, noise=noise, regen=regen)
+	assert len(seen) == 8
+	assert np.allclose(seen[4][..., 4:], plain_start[..., 4:], atol=1e-4)
+	assert not np.allclose(seen[4][..., :4], plain_start[..., :4], atol=1e-2)
 
 
 def tiny_vace_pipeline():

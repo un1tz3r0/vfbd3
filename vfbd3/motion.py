@@ -137,3 +137,42 @@ class MotionCompensator:
 			flow = self.flow * keep + flow * (1.0 - keep)
 		self.flow = flow
 		return warp(prev_image, flow), occ
+
+
+class NoiseField:
+	''' Gaussian noise that travels with the picture, so the diffusion model is seeded with
+	the same noise on the same surface from frame to frame instead of noise that is redrawn
+	(flicker) or fixed to the screen (texture sticking).
+
+	The field is kept at pixel resolution and moved by nearest-neighbour lookup, which copies
+	samples without blending them. A source sample is handed to one destination only; every
+	other destination, anything arriving from outside the frame and anything disoccluded gets
+	fresh noise, so the field stays white. `latent()` sums `block` x `block` pixels into one
+	unit-variance latent sample, which lets sub-latent motion shift the result gradually. '''
+
+	def __init__(self, height, width, channels=4, block=8, seed=None):
+		self.rng = np.random.default_rng(seed)
+		self.block = block
+		self.field = self.rng.standard_normal((height, width, channels), dtype=np.float32)
+
+	def advance(self, flow, occluded=None):
+		''' move the field along `flow` (same convention as `warp`). '''
+		h, w, c = self.field.shape
+		xx, yy = np.meshgrid(np.arange(w), np.arange(h))
+		sx, sy = np.rint(xx + flow[..., 0]).astype(np.int64), np.rint(yy + flow[..., 1]).astype(np.int64)
+		fresh = (sx < 0) | (sx >= w) | (sy < 0) | (sy >= h)
+		if occluded is not None:
+			fresh |= occluded > 0.5
+		source = (sy.clip(0, h - 1) * w + sx.clip(0, w - 1)).ravel()
+		wanted = np.flatnonzero(~fresh.ravel())
+		fresh = np.ones(source.size, bool)
+		fresh[wanted[np.unique(source[wanted], return_index=True)[1]]] = False
+		moved = self.field.reshape(-1, c)[source]
+		moved[fresh] = self.rng.standard_normal((int(fresh.sum()), c), dtype=np.float32)
+		self.field = moved.reshape(h, w, c)
+
+	def latent(self):
+		''' (channels, height / block, width / block) float32, unit variance. '''
+		h, w, c = self.field.shape
+		b = self.block
+		return (self.field.reshape(h // b, b, w // b, b, c).sum(axis=(1, 3)) / b).transpose(2, 0, 1)
