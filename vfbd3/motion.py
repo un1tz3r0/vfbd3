@@ -109,6 +109,22 @@ def flow_to_image(flow):
 	return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
 
 
+def remap_flow(backward, forward, correspondence, confidence, iterations=4):
+	''' backward flow for an image whose pixel q shows what the input showed at
+	correspondence(q): q moves by forward(correspondence(q)), blended with forward(q) where
+	`confidence` is low, and the forward displacement is inverted by fixed-point iteration
+	(b(p) = -d(p + b(p))). '''
+	h, w = forward.shape[:2]
+	corr = cv2.resize(correspondence.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+	conf = cv2.resize(confidence.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)[..., None]
+	moved = cv2.remap(forward, corr[..., 0], corr[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+	displacement = forward + (moved - forward) * conf
+	flow = -displacement
+	for _ in range(iterations):
+		flow = -warp(displacement, flow)
+	return flow.astype(np.float32)
+
+
 class MotionCompensator:
 	''' Carries an image aligned with the previous input frame onto the current one.
 
@@ -126,16 +142,25 @@ class MotionCompensator:
 	def _smooth(self, flow):
 		return cv2.GaussianBlur(flow, (0, 0), self.sigma) if self.sigma > 0 else flow
 
-	def __call__(self, prev_input, cur_input, prev_image):
-		''' returns (prev_image warped onto cur_input, occlusion mask or None). '''
+	def __call__(self, prev_input, cur_input, prev_image, remap=None):
+		''' returns (prev_image warped onto cur_input, occlusion mask or None).
+
+		`remap` = (correspondence, confidence): where each pixel of `prev_image` came from in
+		`prev_input` (an (h, w, 2) position field) and how sure that is (0..1). The image is then
+		moved the way its source moved in the input, instead of by the input's motion at its
+		own position, which matters when the image's shapes differ from the input's. '''
 		flow = self._smooth(self.estimate(cur_input, prev_input))
-		occ = None
-		if self.occlusion:
-			occ = occlusion_mask(flow, self._smooth(self.estimate(prev_input, cur_input)))
+		forward = None
+		if self.occlusion or remap is not None:
+			forward = self._smooth(self.estimate(prev_input, cur_input))
+		occ = occlusion_mask(flow, forward) if self.occlusion else None
 		if self.alpha > 0 and self.flow is not None and self.flow.shape == flow.shape:
 			keep = self.alpha if occ is None else self.alpha * (1.0 - occ)[..., None]
 			flow = self.flow * keep + flow * (1.0 - keep)
 		self.flow = flow
+		if remap is not None:
+			flow = remap_flow(flow, forward, *remap)
+		self.output_flow = flow    # what the image was actually moved by
 		return warp(prev_image, flow), occ
 
 

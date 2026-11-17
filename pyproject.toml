@@ -28,6 +28,9 @@ dependencies = [
 
 [project.optional-dependencies]
 upscale = ["spandrel"]
+aux = ["controlnet_aux", "matplotlib"]
+flux = ["gguf"]
+youtube = ["yt-dlp"]
 dev = ["pytest", "nbformat"]
 
 [project.scripts]

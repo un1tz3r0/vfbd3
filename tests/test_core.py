@@ -129,10 +129,54 @@ def test_noise_field_moves_with_the_flow_and_stays_white():
 def test_fast_presets_fill_only_unset_fields():
 	assert (frame.FrameConfig(prompt="x").steps, frame.FrameConfig(prompt="x").guidance) == (25, 7.5)
 	cfg = frame.FrameConfig(prompt="x", fast="dmd2", guidance=2.0, lora=["mine"])
-	assert (cfg.steps, cfg.guidance, cfg.lora) == (4, 2.0, [frame.FAST["dmd2"]["lora"], "mine"])
+	assert (cfg.steps, cfg.guidance, cfg.lora) == (4, 2.0, [frame.FAST["sdxl"]["dmd2"]["lora"], "mine"])
+	cfg = frame.FrameConfig(prompt="x", backend="flux", fast="schnell")
+	assert (cfg.steps, cfg.guidance, cfg.model) == (4, 0.0, "black-forest-labs/FLUX.1-schnell") and cfg.transformer.endswith(".gguf")
+	assert frame.FrameConfig(prompt="x", backend="sd3").controlnet is None
+	with pytest.raises(ValueError):
+		frame.FrameConfig(prompt="x", backend="flux", reference=1.0)
 	assert frame.FrameConfig(prompt="x", fast="turbo").model == "stabilityai/sdxl-turbo"
 	cfg = vace.VaceConfig(prompt="x", fast="selfforcing")
 	assert (cfg.steps, cfg.guidance, cfg.flow_shift, len(cfg.lora)) == (4, 1.0, 5.0, 1)
 	assert vace.VaceConfig(prompt="x").steps == 30
 	with pytest.raises(ValueError):
 		vace.VaceConfig(prompt="x", fast="nope")
+
+
+def test_remap_flow_moves_output_with_its_source():
+	forward = np.zeros((40, 80, 2), np.float32)
+	forward[:, 40:, 0] = 5                          # the input's right half moves 5 px right
+	ys, xs = np.mgrid[0:40, 0:80].astype(np.float32)
+	corr = np.dstack([np.minimum(xs + 20, 79), ys])  # the output shows the input 20 px further right
+	flow = motion.remap_flow(-forward, forward, corr, np.ones((40, 80), np.float32))
+	assert np.allclose(flow[:, 25:35, 0], -5, atol=0.5)     # sourced from x 45..55: moving
+	assert np.allclose(flow[:, :15, 0], 0, atol=0.5)        # sourced from x 20..35: still
+	none = motion.remap_flow(-forward, forward, corr, np.zeros((40, 80), np.float32))
+	assert np.allclose(none[:, 50:, 0], -5, atol=0.5) and np.allclose(none[:, :30, 0], 0, atol=0.5)
+
+
+def test_colorlock_holds_first_frame_statistics():
+	from vfbd3 import filters
+	rng = np.random.default_rng(0)
+	frame0 = rng.integers(60, 190, (32, 32, 3), dtype=np.uint8)
+	chain = filters.parse_video_filter_spec("colorlock amount=1")
+	chain(frame0)
+	blown = np.clip((frame0.astype(int) - 128) * 2 + 128, 0, 255).astype(np.uint8)
+	fixed = chain(blown)
+	lab = lambda f: cv2.cvtColor(f, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(float).std(0)
+	assert np.allclose(lab(fixed), lab(frame0), rtol=0.15) and not np.allclose(lab(blown), lab(frame0), rtol=0.15)
+
+
+def test_preview_writes_atomically_and_tiles(tmp_path):
+	from vfbd3 import preview
+	out = np.full((48, 64, 3), 200, np.uint8)
+	path = tmp_path / "live" / "preview.png"
+	shown = []
+	show = preview.Preview(str(path), "input,flow,occlusion,noise,output", shown.append)
+	show(input=out, flow=np.ones((48, 64, 2), np.float32), occlusion=None, noise=np.zeros((4, 6, 8), np.float32), output=out)
+	assert cv2.imread(str(path)).shape == (96, 192, 3) and shown[0].shape == (96, 192, 3)
+	assert [p.name for p in path.parent.iterdir()] == ["preview.png"]
+	preview.Preview(str(path))(output=out)
+	assert cv2.imread(str(path)).shape == (48, 64, 3)
+	with pytest.raises(ValueError):
+		preview.Preview(str(path), "output,bogus")

@@ -7,7 +7,7 @@ Two engines, same inputs and outputs:
 
 | | `vace` | `frame` |
 |---|---|---|
-| Model | Wan 2.1 VACE (video diffusion) | SDXL + ControlNet-Union (image diffusion) |
+| Model | Wan 2.1 VACE (video diffusion) | SDXL, Flux or SD3 + ControlNet (image diffusion) |
 | Temporal consistency | from the model, across overlapping windows | motion-compensated feedback of the previous output |
 | Look | stable, coherent motion | trails, drift, flow smearing: the feedback-loop look |
 | Generates at | ~480p, 16 fps, then upscaled | 720p directly, input frame rate |
@@ -21,15 +21,20 @@ disconnect continues from the last finished frame.
 ## Command line
 
 ```sh
-pip install "vfbd3[upscale] @ git+https://github.com/un1tz3r0/vfbd3"
+pip install "vfbd3[upscale,aux,flux,youtube] @ git+https://github.com/un1tz3r0/vfbd3"
 
 vfbd3 vace  in.mp4 out.mp4 --prompt "a colorful murakami mural" --upscale 720 --fast causvid
-vfbd3 frame in.mp4 out.mp4 --prompt "murakami mural" --denoise 0.5 --fast lcm --tiny-vae
+vfbd3 frame in.mp4 out.mp4 --prompt "murakami mural" --denoise 0.5 --fast lcm --tiny-vae encoder
+vfbd3 frame in.mp4 out.mp4 --prompt "murakami mural" --feedthrough 1 --reference 1 --reference-adain 0.5 \
+    --preview live.png --preview-panels input,flow,occlusion,output
+vfbd3 frame in.mp4 out.mp4 --prompt "murakami mural" --backend flux --control hed
 vfbd3 upscale out.mp4 out_1080.mp4 --short-side 1080
 vfbd3 filters          # list filters for the --*-filter options
 ```
 
 `vfbd3 vace --help` and `vfbd3 frame --help` list every option. ffmpeg must be on the path.
+The extras are optional: `aux` adds the controlnet_aux detectors, `flux` the GGUF loader,
+`youtube` yt-dlp for `vfbd3.video.download(url)`.
 
 ## How each engine works
 
@@ -55,6 +60,56 @@ surface is seeded with the same noise in every frame. `--noise fixed` keeps it s
 and `--noise random` redraws it each frame, as controlnetvideo did. Filter chains (`--input-filter`, `--feedback-filter`,
 `--control-filter`, `--output-filter`) use the controlnetvideo filter syntax.
 
+### frame backends
+
+| `--backend` | model | ControlNet | on a T4 |
+|---|---|---|---|
+| `sdxl` (default) | SDXL base, or any SDXL checkpoint | xinsir ControlNet-Union: depth, normal, softedge, lines, pose | fp16, fits |
+| `flux` | FLUX.1-dev, transformer as 4-bit GGUF | Shakker-Labs Union-Pro-2.0: depth, softedge, lines, pose, gray | about 11 GB; T5 encodes the prompt once and is freed first |
+| `sd3` | SD3 Medium | InstantX depth / canny / pose, alimama softedge | fp16, fits |
+
+Flux and SD3 are gated on Hugging Face (accept the licence, log in or set `HF_TOKEN`).
+`--transformer` takes any single-file or GGUF checkpoint, e.g. a Q8 GGUF on a bigger card.
+
+### Controls
+
+`depth` (Depth Anything V2 small), `depth_large`, `zoe`, `midas`, `normal` (from depth),
+`canny` and `gray` need nothing extra. `hed`, `pidi`, `lineart`, `lineart_anime`, `mlsd`,
+`pose` (OpenPose with hands and face) and `normalbae` use controlnet_aux. The backend picks
+the ControlNet or union mode from the control's family.
+
+### Reference attention (sdxl)
+
+controlnetvideo's reference-only mode, generalised. Every self-attention layer attends to
+its own tokens plus those of the previous output (`--reference`, motion-compensated unless
+`--no-reference-warp`) and of the current input (`--reference-input`). Each strength is added
+to the attention scores as log(strength), so 0 is off, 1 is plain shared attention and more
+favours that image. `--reference-adain` matches feature statistics to the previous output,
+which holds colour. The old `refxl` recipe: `--feedthrough 1 --denoise 0.5 --reference 1
+--reference-adain 0.5`. It costs one extra UNet pass per step.
+
+`--flow-remap` (experimental) uses the same attention as a correspondence: for each output
+location, where in the input frame it was drawn from. The next frame then moves each part of
+the output by the input motion *of its source*, rather than the motion at its own position,
+which helps when heavy denoising has moved or reshaped things. It is read at the coarsest
+attention level (1/32 of the frame) and falls back to plain flow where attention is diffuse.
+
+### Live preview
+
+`--preview FILE` rewrites FILE after every frame, writing a temporary file and renaming it
+over the old one so a viewer never sees a partial image. `--preview-panels` makes it a
+labelled mosaic of `input, control, flow, occlusion, noise, feedback, init, output,
+confidence` (or `all`). In Python, `frame.run(..., on_preview=fn)` receives each image.
+
+### Colour creep
+
+A feedback loop compounds whatever happens to colour each frame. Measured over 15 encode and
+decode round trips with no diffusion at all: TAESDXL's decoder raises mean chroma from 12.5 to
+23.6 and clips 15% of pixels; the full SDXL VAE slowly desaturates instead. Hence
+`--tiny-vae encoder` (tiny encoder, full decoder). To hold the look, use `--color-fix`
+(match the first output) or a feedback filter: `colorlock` holds brightness, contrast and
+saturation at the first frame's, `autolevel` restretches lightness, `equalize` is CLAHE.
+
 ## Fewer steps
 
 `--fast` picks a distilled setup and sets `--steps` and `--guidance` to match (both can still
@@ -71,8 +126,7 @@ be overridden, and `--lora` adds more LoRAs on top).
 
 All of them run without classifier-free guidance, which halves the work per step again. In
 `frame`, `--steps` is the full schedule and a frame runs `steps * denoise` of it, so `turbo`
-or `dmd2` at `--denoise 0.25` is a single step. `--tiny-vae` swaps the SDXL autoencoder for
-TAESDXL.
+or `dmd2` at `--denoise 0.25` is a single step. Flux has `--fast schnell` (4 steps).
 
 ## Development
 
@@ -81,11 +135,12 @@ uv venv && uv pip install -e ".[upscale,dev]"
 pytest                 # runs on CPU; -m "not slow" skips the tests that download models
 ```
 
-The tests exercise both engine loops, chunking, resume, motion compensation and the upscaler
-on CPU, using a tiny randomly-initialised VACE pipeline. They do not run the full-size models.
+The tests exercise both engine loops, chunking, resume, motion compensation, the backends'
+masked regeneration, reference attention, previews and the upscaler on CPU, using tiny
+randomly-initialised SDXL, Flux, SD3 and VACE pipelines. They do not run the full-size models.
 
 ## Not here yet
 
 Audio-reactive parameter animation (`frame.run` takes an `on_frame` hook for it), prompt
-sequencing, pose/soft-edge controls, frame interpolation back to the input frame rate for
+sequencing, reference attention for Flux and SD3, frame interpolation back to the input frame rate for
 `vace`, and a diffusion-based upscaler.

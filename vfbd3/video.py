@@ -190,3 +190,20 @@ class Workdir:
 	def load_image(self, name):
 		image = cv2.imread(str(self.path / name), cv2.IMREAD_COLOR)
 		return None if image is None else cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def download(url, folder=".", max_height=1080):
+	''' fetch a video (YouTube or anything else yt-dlp supports) as mp4 into `folder`, once;
+	returns its path. Needs `pip install yt-dlp`. '''
+	import yt_dlp
+	options = {
+		"format": f"bv*[height<={max_height}][ext=mp4]+ba[ext=m4a]/b[height<={max_height}][ext=mp4]/b",
+		"merge_output_format": "mp4",
+		"outtmpl": str(pathlib.Path(folder) / "%(title).80B [%(id)s].%(ext)s"),
+		"noplaylist": True,
+		"quiet": True,
+		"noprogress": True,
+	}
+	with yt_dlp.YoutubeDL(options) as ydl:
+		info = ydl.extract_info(url, download=True)
+		return str(pathlib.Path(ydl.prepare_filename(info)).with_suffix(".mp4"))

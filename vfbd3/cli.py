@@ -11,9 +11,9 @@ def shared_options(fn):
 		click.argument("output_video", type=click.Path(dir_okay=False)),
 		click.option("--prompt", required=True, help="what the output should look like"),
 		click.option("--negative-prompt", default=None, help="what to steer away from"),
-		click.option("--control", default="depth", show_default=True, help="structure signal taken from the input: depth, canny (vace also: gray, none)"),
+		click.option("--control", default="depth", show_default=True, help="structure signal taken from the input: depth, depth_large, zoe, midas, normal, normalbae, canny, lineart, lineart_anime, mlsd, hed, pidi, pose, gray, none. hed/pidi/lineart*/mlsd/pose/normalbae need controlnet_aux"),
 		click.option("--control-scale", type=float, default=1.0, show_default=True, help="how strongly the control signal is followed"),
-		click.option("--fast", default=None, help="few-step preset, which sets steps and guidance unless given. vace: causvid, selfforcing. frame: lcm, lightning, dmd2, turbo"),
+		click.option("--fast", default=None, help="few-step preset, which sets steps and guidance unless given. vace: causvid, selfforcing. frame sdxl: lcm, lightning, dmd2, turbo; frame flux: schnell"),
 		click.option("--steps", type=int, default=None, help="denoising steps"),
 		click.option("--guidance", type=float, default=None, help="prompt guidance scale"),
 		click.option("--seed", type=int, default=None, help="seed for the starting noise"),
@@ -59,8 +59,10 @@ def vace(input_video, output_video, **options):
 
 @main.command()
 @shared_options
-@click.option("--model", default=None, help="SDXL checkpoint (default: stabilityai/stable-diffusion-xl-base-1.0)")
-@click.option("--controlnet", default=None, help="SDXL ControlNet-Union checkpoint")
+@click.option("--backend", type=click.Choice(["sdxl", "flux", "sd3"]), default=None, help="image model family (default sdxl)")
+@click.option("--model", default=None, help="base model repo (default: SDXL base, FLUX.1-dev, or SD3 Medium)")
+@click.option("--transformer", default=None, help="flux/sd3: single-file or GGUF transformer, path or URL (flux default: FLUX.1-dev Q4_K_S GGUF)")
+@click.option("--controlnet", default=None, help="ControlNet repo (default: union model for sdxl and flux, per-control InstantX/alimama model for sd3)")
 @click.option("--short-side", type=int, default=None, help="short side of the frames generated (default 720)")
 @click.option("--fps", type=float, default=None, help="frame rate to process at (default: the input's)")
 @click.option("--denoise", type=float, default=None, help="0..1, how much of each frame is re-generated (default 0.5)")
@@ -72,8 +74,15 @@ def vace(input_video, output_video, **options):
 @click.option("--occlusion/--no-occlusion", default=None, help="re-generate newly revealed areas instead of smearing the previous output into them (default on)")
 @click.option("--occlusion-denoise", type=float, default=None, help="0..1, denoise used inside newly revealed areas (default 1.0); the rest of the frame keeps --denoise")
 @click.option("--noise", default=None, help="starting noise: warp (default, one noise field carried along the motion), fixed (same every frame), random (new every frame)")
-@click.option("--tiny-vae", is_flag=True, default=None, help="use the tiny SDXL autoencoder: much faster encode and decode, slightly softer detail")
+@click.option("--tiny-vae", type=click.Choice(["encoder", "both"]), default=None, help="use a tiny autoencoder to encode frames, or for both directions (fastest, but its decoder drifts colour in a feedback loop)")
 @click.option("--ip-adapter", type=float, default=None, help="> 0: also condition on the warped previous output as an image prompt, at this scale")
+@click.option("--reference", type=float, default=None, help="sdxl: shared self-attention with the previous output at this strength (1 = plain, 0 = off)")
+@click.option("--reference-warp/--no-reference-warp", default=None, help="motion-compensate the previous output used by --reference (default on)")
+@click.option("--reference-input", type=float, default=None, help="sdxl: shared self-attention with the current input frame at this strength")
+@click.option("--reference-adain", type=float, default=None, help="0..1, match feature statistics to the first reference, holding colour and contrast")
+@click.option("--flow-remap", type=float, default=None, help="sdxl, experimental, 0..1: move each output region by the input motion of what it was drawn from (attention correspondence)")
+@click.option("--preview", default=None, help="image file rewritten atomically after every frame, for an auto-refreshing viewer")
+@click.option("--preview-panels", default=None, help="comma-separated: input, control, flow, occlusion, noise, feedback, init, output, confidence, or all (default output)")
 @click.option("--input-filter", default=None, help="filter chain applied to each input frame (see `vfbd3 filters`)")
 @click.option("--feedback-filter", default=None, help="filter chain applied to the motion-compensated previous output")
 @click.option("--control-filter", default=None, help="filter chain applied to the control image")

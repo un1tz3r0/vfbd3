@@ -3,53 +3,38 @@ Per-frame img2img with motion-compensated feedback, the technique from controlne
 
 Each frame: estimate the input's motion since the previous frame, carry the previous
 *output* along that motion, blend it with the current input, and denoise the blend under a
-control signal extracted from the input. The result is fed back for the next frame.
+control signal extracted from the input. The result is fed back for the next frame. The
+image model is a backend (see backends.py): SDXL, Flux or SD3.
 """
 
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from PIL import Image
 from tqdm.auto import tqdm
 
-from . import common, control as controls, filters, motion, video
+from . import backends, common, control as controls, filters, motion, preview as previews, video
 
-# control-type indices of the SDXL ControlNet-Union model
-UNION_MODES = {"depth": 1, "canny": 3}
-
-DEFAULTS = dict(model="stabilityai/stable-diffusion-xl-base-1.0", steps=25, guidance=7.5)
-
-# few-step setups: a distillation LoRA (or distilled checkpoint) with the scheduler it expects and
-# no classifier-free guidance. `steps` is the full schedule; a frame runs steps * denoise of them.
-FAST = {
-	"lcm": dict(steps=8, guidance=1.0, scheduler=("LCMScheduler", {}),
-		lora="latent-consistency/lcm-lora-sdxl:pytorch_lora_weights.safetensors"),
-	"lightning": dict(steps=8, guidance=1.0, scheduler=("EulerDiscreteScheduler", {"timestep_spacing": "trailing"}),
-		lora="ByteDance/SDXL-Lightning:sdxl_lightning_8step_lora.safetensors"),
-	"dmd2": dict(steps=4, guidance=1.0, scheduler=("LCMScheduler", {}),
-		lora="tianweiy/DMD2:dmd2_sdxl_4step_lora_fp16.safetensors"),
-	# SDXL-Turbo is trained at 512 px and for 1-4 steps: pair it with short_side 512 and an upscale
-	"turbo": dict(steps=4, guidance=1.0, model="stabilityai/sdxl-turbo",
-		scheduler=("EulerAncestralDiscreteScheduler", {"timestep_spacing": "trailing"})),
-}
+FAST = backends.FAST
 
 
 @dataclass
 class FrameConfig:
 	prompt: str
 	negative_prompt: str = ""
-	model: str | None = None       # default stabilityai/stable-diffusion-xl-base-1.0
-	controlnet: str = "xinsir/controlnet-union-sdxl-1.0"
-	control: str = "depth"         # depth or canny
+	backend: str = "sdxl"          # sdxl, flux or sd3
+	model: str | None = None       # base model repo; default depends on the backend
+	transformer: str | None = None # flux/sd3: single-file or GGUF transformer checkpoint (path or URL)
+	controlnet: str | None = None  # default depends on the backend (and, for sd3, the control)
+	control: str = "depth"         # see control.CONTROLS
 	control_scale: float = 1.0
 	short_side: int = 720
 	max_area: int = 1280 * 720
 	fps: float | None = None       # None keeps the input's frame rate
 	fast: str | None = None        # a FAST preset; sets steps, guidance (and model) unless given
-	steps: int | None = None       # default 25
-	guidance: float | None = None  # default 7.5
-	tiny_vae: bool = False         # TAESDXL instead of the full VAE: far faster, slightly softer
+	steps: int | None = None       # default depends on the backend
+	guidance: float | None = None
+	tiny_vae: str | None = None    # "encoder": tiny VAE encodes frames; "both": decodes too (faster, but drifts colour in feedback)
 	denoise: float = 0.5           # img2img strength: how much of each frame is re-generated
 	first_denoise: float = 1.0     # same, for the first frame (nothing to feed back yet)
 	feedthrough: float = 0.0       # share of the raw input in the init image; the rest is feedback
@@ -59,6 +44,11 @@ class FrameConfig:
 	occlusion: bool = True         # re-generate areas the flow cannot explain (newly revealed ones)
 	occlusion_denoise: float = 1.0 # denoise inside those areas; the rest of the frame gets `denoise`
 	ip_adapter: float = 0.0        # > 0: also feed the warped previous output in as an image prompt
+	reference: float = 0.0         # sdxl: shared self-attention with the previous output, at this strength
+	reference_warp: bool = True    # ... motion-compensated (True) or as it was (False)
+	reference_input: float = 0.0   # sdxl: shared self-attention with the current input frame
+	reference_adain: float = 0.0   # 0..1, match feature statistics to the first reference (holds colour)
+	flow_remap: float = 0.0        # sdxl, experimental: 0..1, move the output by its own objects' input motion
 	color_fix: float = 0.0         # pull each output's colours toward the first output
 	noise: str = "warp"            # warp: one noise field carried along the motion; fixed; random
 	seed: int | None = None
@@ -66,6 +56,8 @@ class FrameConfig:
 	feedback_filter: str | None = None
 	control_filter: str | None = None
 	output_filter: str | None = None
+	preview: str | None = None     # image file rewritten (atomically) after every frame
+	preview_panels: str = "output" # comma-separated preview.PANELS, or "all", for a mosaic
 	lora: tuple = ()
 	start: float | None = None
 	duration: float | None = None
@@ -74,134 +66,37 @@ class FrameConfig:
 	restart: bool = False
 
 	def __post_init__(self):
-		common.apply_preset(self, FAST, DEFAULTS)
+		if self.backend not in backends.BACKENDS:
+			raise ValueError(f"backend must be one of {', '.join(backends.BACKENDS)}, got {self.backend!r}")
+		common.apply_preset(self, FAST[self.backend], backends.DEFAULTS[self.backend])
+		if self.tiny_vae not in (None, "encoder", "both"):
+			raise ValueError(f"tiny_vae must be encoder or both, got {self.tiny_vae!r}")
+		if self.backend != "sdxl" and (self.reference or self.reference_input or self.flow_remap or self.ip_adapter):
+			raise ValueError("reference, reference_input, flow_remap and ip_adapter need the sdxl backend")
 		if self.noise not in ("warp", "fixed", "random"):
 			raise ValueError(f"noise must be warp, fixed or random, got {self.noise!r}")
 
 
-class SDXLUnionBackend:
-	''' SDXL + ControlNet-Union img2img. `generate` is the whole interface the frame loop
-	needs, so other still-image models can be dropped in behind it. '''
-
-	def __init__(self, cfg, device=None, pipe=None):
-		import torch
-		self.cfg = cfg
-		self.torch = torch
-		if cfg.control not in UNION_MODES:
-			raise ValueError(f"control {cfg.control!r} is not supported by the SDXL union backend; use one of {sorted(UNION_MODES)}")
-		device = device or common.pick_device()
-		self.pipe = pipe = pipe or self.load(cfg, device)
-		if cfg.fast and "scheduler" in FAST[cfg.fast]:
-			import diffusers
-			name, args = FAST[cfg.fast]["scheduler"]
-			pipe.scheduler = getattr(diffusers, name).from_config(pipe.scheduler.config, **args)
-		common.load_loras(pipe, cfg.lora)
-		if cfg.ip_adapter > 0:
-			pipe.load_ip_adapter("h94/IP-Adapter", subfolder="sdxl_models", weight_name="ip-adapter_sdxl.bin")
-		if device.startswith("cuda") and common.cuda_vram_gb() < 14:
-			pipe.enable_model_cpu_offload()
-		else:
-			pipe.to(device)
-		pipe.set_progress_bar_config(disable=True)
-		# the prompt never changes: encode it once, then drop the text encoders to free their memory
-		names = ("prompt_embeds", "negative_prompt_embeds", "pooled_prompt_embeds", "negative_pooled_prompt_embeds")
-		with torch.no_grad():
-			self.embeds = dict(zip(names, pipe.encode_prompt(
-				cfg.prompt, negative_prompt=cfg.negative_prompt, device=pipe._execution_device)))
-		pipe.text_encoder = pipe.text_encoder_2 = None
-		common.free_memory()
-		self.generator = torch.Generator("cpu")
-		if cfg.seed is not None:
-			self.generator.manual_seed(cfg.seed)
-
-	@staticmethod
-	def load(cfg, device):
-		import torch
-		from diffusers import AutoencoderKL, AutoencoderTiny, ControlNetUnionModel, StableDiffusionXLControlNetUnionImg2ImgPipeline
-		dtype = torch.float16 if device.startswith("cuda") else torch.float32
-		controlnet = ControlNetUnionModel.from_pretrained(cfg.controlnet, torch_dtype=dtype)
-		if cfg.tiny_vae:
-			vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=dtype)
-		else:
-			vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=dtype)
-		return StableDiffusionXLControlNetUnionImg2ImgPipeline.from_pretrained(
-			cfg.model, controlnet=controlnet, vae=vae, torch_dtype=dtype, use_safetensors=True,
-			**({"variant": "fp16"} if cfg.model.startswith("stabilityai/") else {}))
-
-	def start(self, init, denoise, noise, regen):
-		''' the latents a frame starts from: `init` encoded, plus `noise` at the level `denoise`
-		calls for. With a `regen` mask, the run starts at the level of the highest per-pixel
-		denoise instead, and the returned step callback holds every pixel at its noised original
-		until the schedule comes down to that pixel's own denoise (differential diffusion). '''
-		from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import retrieve_latents
-		torch, pipe, steps = self.torch, self.pipe, self.cfg.steps
-		device, dtype = pipe._execution_device, pipe.unet.dtype
-		with torch.no_grad():
-			image = pipe.image_processor.preprocess(Image.fromarray(init)).to(device, pipe.vae.dtype)
-			clean = retrieve_latents(pipe.vae.encode(image), sample_mode="argmax").to(dtype) * pipe.vae.config.scaling_factor
-		if noise is None:
-			noise = torch.randn(clean.shape, generator=self.generator)
-		else:
-			noise = torch.from_numpy(np.ascontiguousarray(noise))[None]
-		noise = noise.to(device, dtype)
-
-		strength, own_steps = denoise, None
-		if regen is not None:
-			area = torch.nn.functional.interpolate(torch.from_numpy(regen)[None, None].float(), size=clean.shape[-2:], mode="area")
-			per_pixel = denoise + (max(self.cfg.occlusion_denoise, denoise) - denoise) * area
-			strength = float(per_pixel.max())
-			# how many steps img2img would run for each pixel at its own denoise
-			own_steps = (per_pixel * steps + 1e-4).floor().clamp(min=1).to(device)
-		pipe.scheduler.set_timesteps(steps, device=device)
-		timesteps, _ = pipe.get_timesteps(steps, strength, device)
-		latents = pipe.scheduler.add_noise(clean, noise, timesteps[:1])
-
-		def hold(pipe, i, t, tensors):
-			remaining = len(timesteps) - i - 1
-			if remaining:
-				held = pipe.scheduler.add_noise(clean, noise, timesteps[i + 1:i + 2])
-				tensors["latents"] = torch.where(own_steps <= remaining, held, tensors["latents"])
-			return tensors
-
-		return dict(latents=latents, strength=strength, callback_on_step_end=hold if regen is not None else None)
-
-	def generate(self, init, control, denoise, params, reference=None, noise=None, regen=None):
-		''' `noise`: (4, h/8, w/8) starting noise, or None for the backend's own.
-		`regen`: (h, w) float mask, 1 where the frame is to be generated anew. '''
-		cfg, pipe = self.cfg, self.pipe
-		kwargs = {}
-		if cfg.ip_adapter > 0:
-			pipe.set_ip_adapter_scale(params.get("ip_adapter", cfg.ip_adapter))
-			kwargs["ip_adapter_image"] = Image.fromarray(reference if reference is not None else init)
-		# img2img runs int(steps * strength) steps; keep that at one or more
-		denoise = min(1.0, max(denoise, 1.0 / cfg.steps + 1e-3))
-		image = pipe(
-			**self.embeds, **self.start(init, denoise, noise, regen), image=Image.fromarray(init),
-			control_image=[Image.fromarray(control)], control_mode=[UNION_MODES[cfg.control]],
-			controlnet_conditioning_scale=params.get("control_scale", cfg.control_scale),
-			guidance_scale=params.get("guidance", cfg.guidance),
-			num_inference_steps=cfg.steps, width=init.shape[1], height=init.shape[0],
-			generator=self.generator, **kwargs,
-		).images[0]
-		return np.asarray(image.convert("RGB"))
-
-
-def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=None):
+def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=None, on_preview=None):
 	''' restyle `input_path` into `output_path`.
 
 	`on_frame(index, seconds)` may return a dict overriding `denoise`, `feedthrough`,
-	`control_scale`, `guidance` or `ip_adapter` for that frame; this is the hook parameter
-	animation (audio-reactive or otherwise) plugs into. '''
+	`control_scale`, `guidance`, `ip_adapter`, `reference` or `reference_input` for that frame;
+	this is the hook parameter animation (audio-reactive or otherwise) plugs into.
+	`on_preview(image)` receives each preview image (see `cfg.preview_panels`). '''
 	info = video.probe(input_path)
 	fps = cfg.fps or info.fps
 	size = video.fit_size(info.width, info.height, short_side=cfg.short_side, max_area=cfg.max_area, multiple=16)
 	work = video.Workdir(output_path, f"frame {input_path} {size[0]}x{size[1]}@{fps}", restart=cfg.restart)
 	print(f"frame: {info.width}x{info.height} -> {size[0]}x{size[1]} at {fps:g} fps, resuming at frame {work.done}")
 
-	backend = backend or SDXLUnionBackend(cfg)
+	show = previews.Preview(cfg.preview, cfg.preview_panels, on_preview)
+	backend = backend or backends.create(cfg)
 	control_fn = control_fn or controls.create_control(cfg.control)
 	compensate = motion.MotionCompensator(cfg.motion_estimator, cfg.motion_alpha, cfg.motion_sigma, cfg.occlusion)
-	field = None if cfg.noise == "random" else motion.NoiseField(size[1], size[0], seed=cfg.seed)
+	scale = getattr(backend, "latent_scale", 8)
+	field = None if cfg.noise == "random" else motion.NoiseField(
+		size[1], size[0], channels=getattr(backend, "latent_channels", 4), block=scale, seed=cfg.seed)
 	chains = {
 		name: filters.parse_video_filter_spec(getattr(cfg, f"{name}_filter"), fps=fps)
 		for name in ("input", "feedback", "control", "output")}
@@ -222,15 +117,20 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 		params = (on_frame(index, index / fps) if on_frame else None) or {}
 		feedthrough = params.get("feedthrough", cfg.feedthrough)
 
-		regen = None
+		regen = feedback = None
 		if prev_output is None:
-			feedback = None
 			init = frame
 			denoise = cfg.first_denoise
 		else:
-			feedback, occluded = compensate(prev_input, frame, prev_output)
+			correspondence = getattr(backend, "correspondence", None)
+			remap = None
+			if cfg.flow_remap > 0 and correspondence is not None:
+				corr, spread = correspondence
+				# confident where attention was concentrated within about one coarse token
+				remap = (corr * scale, cfg.flow_remap * np.exp(-(spread * scale / 64.0) ** 2))
+			feedback, occluded = compensate(prev_input, frame, prev_output, remap=remap)
 			if cfg.noise == "warp":
-				field.advance(compensate.flow, occluded)
+				field.advance(compensate.output_flow, occluded)
 			if occluded is not None:
 				# drop speckle, then feather: those areas start from the input and are re-generated
 				regen = cv2.GaussianBlur(cv2.morphologyEx(occluded, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)), (0, 0), 3)
@@ -243,8 +143,9 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 			denoise = params.get("denoise", cfg.denoise)
 
 		control = chains["control"](control_fn([frame])[0], **position)
-		output = backend.generate(init, control, denoise, params, reference=feedback,
-			noise=field.latent() if field else None, regen=regen)
+		noise = field.latent() if field else None
+		output = backend.generate(init, control, denoise, params, noise=noise, regen=regen,
+			images=dict(input=frame, feedback=feedback, previous=prev_output))
 		if first_output is None:
 			first_output = output
 		else:
@@ -253,6 +154,11 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 
 		work.save(index, output)
 		work.commit(index + 1)
+		if show.active:
+			correspondence = getattr(backend, "correspondence", None)
+			show(input=frame, control=control, flow=compensate.output_flow if feedback is not None else None,
+				occlusion=regen, noise=noise, feedback=feedback, init=init, output=output,
+				confidence=np.exp(-(correspondence[1] * scale / 64.0) ** 2) if correspondence else None)
 		prev_input, prev_output = frame, output
 
 	return common.finish(work, output_path, fps, audio_from=input_path if info.has_audio else None,

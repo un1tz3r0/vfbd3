@@ -370,6 +370,46 @@ def _gamma(frame, p, state, ctx):
 	return _u8(np.power(_f32(frame), 1.0 / g))
 
 
+def _lab_stats(lab):
+	return lab.reshape(-1, 3).mean(axis=0), lab.reshape(-1, 3).std(axis=0) + 1e-6
+
+
+@register('colorlock', {'amount': ('float', 0.5), 'contrast': ('float', 1.0), 'sat': ('float', 1.0)},
+          doc="hold brightness, contrast and saturation at those of the first frame seen (Lab mean and "
+              "spread), countering the creep a feedback loop builds up. contrast/sat scale the targets")
+def _colorlock(frame, p, state, ctx):
+	lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB).astype(np.float32)
+	mean, std = _lab_stats(lab)
+	if 'target' not in state:
+		state['target'] = mean, std
+	t_mean, t_std = state['target']
+	t_std = t_std * np.float32([p['contrast'], p['sat'], p['sat']])
+	locked = (lab - mean) * (t_std / std) + t_mean
+	out = lab + (locked - lab) * float(np.clip(p['amount'], 0.0, 1.0))
+	return cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+
+@register('autolevel', {'low': ('float', 0.5), 'high': ('float', 99.5), 'amount': ('float', 1.0)},
+          doc="stretch lightness so the low/high percentiles become black and white (fixes washed-out "
+              "frames, and pulls blown-out ones back when the percentiles are inside the clipped range)")
+def _autolevel(frame, p, state, ctx):
+	lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB).astype(np.float32)
+	lo, hi = np.percentile(lab[..., 0], [p['low'], p['high']])
+	stretched = (lab[..., 0] - lo) * (255.0 / max(hi - lo, 1.0))
+	lab[..., 0] += (stretched - lab[..., 0]) * p['amount']
+	return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+
+@register('equalize', {'clip': ('float', 2.0), 'tiles': ('int', 8), 'amount': ('float', 1.0)},
+          doc="adaptive histogram equalization (CLAHE) of lightness, blended in by amount")
+def _equalize(frame, p, state, ctx):
+	lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
+	tiles = max(1, p['tiles'])
+	eq = cv2.createCLAHE(clipLimit=max(0.1, p['clip']), tileGridSize=(tiles, tiles)).apply(lab[..., 0])
+	lab[..., 0] = cv2.addWeighted(eq, p['amount'], lab[..., 0], 1.0 - p['amount'], 0)
+	return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+
 # ----- geometric distortions (origin + direction + velocity, accumulated over time) ----------
 
 def _warp(frame, M, border):
