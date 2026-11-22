@@ -26,7 +26,7 @@ def test_frame_engine_runs_and_resumes(clip, tmp_path):
 	backend = RecordingBackend()
 	previews = []
 	frame.run(clip, out, cfg, backend=backend, on_frame=lambda i, t: {"denoise": 0.3} if i == 5 else None, on_preview=previews.append)
-	assert len(previews) == 12 and previews[-1].shape == (144, 192, 3) and (tmp_path / "preview.jpg").exists()
+	assert len(previews) == 12 and previews[-1].shape == (192, 256, 3) and (tmp_path / "preview.jpg").exists()
 
 	assert len(backend.calls) == 12
 	assert backend.calls[0] == dict(denoise=1.0, has_feedback=False, shape=(48, 64, 3))

@@ -19,7 +19,7 @@ import inspect
 import numpy as np
 from PIL import Image
 
-from . import common, control as controls
+from . import common, control as controls, preview as previews
 
 # ControlNet-Union (xinsir, SDXL) mode per control family
 SDXL_UNION_MODES = {"pose": 0, "depth": 1, "softedge": 2, "lines": 3, "normal": 4}
@@ -206,7 +206,9 @@ class SDXLBackend(Backend):
 		if cfg.ip_adapter > 0:
 			pipe.load_ip_adapter("h94/IP-Adapter", subfolder="sdxl_models", weight_name="ip-adapter_sdxl.bin")
 		self.reference, self.correspondence = None, None
-		if cfg.reference > 0 or cfg.reference_input > 0 or cfg.flow_remap > 0:
+		# record the attention correspondence for flow remap, or just to show it in the preview
+		self.record = cfg.flow_remap > 0 or bool(set(previews.ATTENTION) & set(previews.parse(cfg.preview_panels)))
+		if cfg.reference > 0 or cfg.reference_input > 0 or self.record:
 			from .reference import Reference
 			self.reference = Reference(pipe.unet)
 		if device.startswith("cuda") and common.cuda_vram_gb() < 14:
@@ -241,7 +243,7 @@ class SDXLBackend(Backend):
 		previous = images.get("feedback" if cfg.reference_warp else "previous")
 		if cfg.reference > 0 and previous is not None:
 			refs.append((self.encode(previous), params.get("reference", cfg.reference)))
-		if (cfg.reference_input > 0 or cfg.flow_remap > 0) and images.get("input") is not None:
+		if (cfg.reference_input > 0 or self.record) and images.get("input") is not None:
 			refs.append((self.encode(images["input"]), params.get("reference_input", cfg.reference_input)))
 		return refs
 
@@ -255,7 +257,7 @@ class SDXLBackend(Backend):
 		refs = self.references(params, images) if self.reference is not None else []
 		if refs:
 			active = self.reference.active(pipe.scheduler, refs, self.noise, adain=cfg.reference_adain,
-				record=cfg.flow_remap > 0, steps=self.steps_run)
+				record=self.record, steps=self.steps_run)
 		with active:
 			image = pipe(**kwargs, image=Image.fromarray(init), control_image=[Image.fromarray(control)],
 				control_mode=[SDXL_UNION_MODES[self.family]]).images[0]

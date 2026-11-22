@@ -178,5 +178,11 @@ def test_preview_writes_atomically_and_tiles(tmp_path):
 	assert [p.name for p in path.parent.iterdir()] == ["preview.png"]
 	preview.Preview(str(path))(output=out)
 	assert cv2.imread(str(path)).shape == (48, 64, 3)
+	flow = np.zeros((48, 64, 2), np.float32)
+	flow[..., 0] = -3
+	corr = np.stack(np.meshgrid(np.arange(4) * 16 + 8.0, np.arange(3) * 16 + 8.0), -1) + 5
+	sheet = preview.mosaic(dict(output=out, vectors=(out, flow), attention=(out, corr, np.ones((3, 4))), attended=(out, corr)),
+		("vectors", "attention", "attended", "output"))
+	assert sheet.shape == (96, 128, 3) and sheet[:48, :64].std() > 0
 	with pytest.raises(ValueError):
 		preview.Preview(str(path), "output,bogus")

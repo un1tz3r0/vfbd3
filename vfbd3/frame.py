@@ -77,6 +77,11 @@ class FrameConfig:
 			raise ValueError(f"noise must be warp, fixed or random, got {self.noise!r}")
 
 
+def confidence(spread, scale):
+	''' 0..1 per coarse token: near 1 where attention was concentrated within about one token. '''
+	return np.exp(-(spread * scale / 64.0) ** 2)
+
+
 def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=None, on_preview=None):
 	''' restyle `input_path` into `output_path`.
 
@@ -117,7 +122,7 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 		params = (on_frame(index, index / fps) if on_frame else None) or {}
 		feedthrough = params.get("feedthrough", cfg.feedthrough)
 
-		regen = feedback = None
+		regen = feedback = warped = None
 		if prev_output is None:
 			init = frame
 			denoise = cfg.first_denoise
@@ -126,9 +131,9 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 			remap = None
 			if cfg.flow_remap > 0 and correspondence is not None:
 				corr, spread = correspondence
-				# confident where attention was concentrated within about one coarse token
-				remap = (corr * scale, cfg.flow_remap * np.exp(-(spread * scale / 64.0) ** 2))
+				remap = (corr * scale, cfg.flow_remap * confidence(spread, scale))
 			feedback, occluded = compensate(prev_input, frame, prev_output, remap=remap)
+			warped = feedback
 			if cfg.noise == "warp":
 				field.advance(compensate.output_flow, occluded)
 			if occluded is not None:
@@ -155,10 +160,14 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 		work.save(index, output)
 		work.commit(index + 1)
 		if show.active:
-			correspondence = getattr(backend, "correspondence", None)
-			show(input=frame, control=control, flow=compensate.output_flow if feedback is not None else None,
-				occlusion=regen, noise=noise, feedback=feedback, init=init, output=output,
-				confidence=np.exp(-(correspondence[1] * scale / 64.0) ** 2) if correspondence else None)
+			corr, spread = getattr(backend, "correspondence", None) or (None, None)
+			corr = None if corr is None else corr * scale
+			conf = None if spread is None else confidence(spread, scale)
+			flow = compensate.output_flow if feedback is not None else None
+			show(input=frame, control=control, flow=flow, vectors=None if flow is None else (prev_input, flow),
+				occlusion=regen, noise=noise, reference=prev_output, warped=warped, feedback=feedback, init=init,
+				output=output, attention=None if corr is None else (frame, corr, conf),
+				attended=None if corr is None else (frame, corr), confidence=conf)
 		prev_input, prev_output = frame, output
 
 	return common.finish(work, output_path, fps, audio_from=input_path if info.has_audio else None,
