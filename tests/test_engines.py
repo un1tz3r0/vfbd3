@@ -26,7 +26,10 @@ def test_frame_engine_runs_and_resumes(clip, tmp_path):
 	backend = RecordingBackend()
 	previews = []
 	frame.run(clip, out, cfg, backend=backend, on_frame=lambda i, t: {"denoise": 0.3} if i == 5 else None, on_preview=previews.append)
-	assert len(previews) == 12 and previews[-1].shape == (144, 192, 3) and (tmp_path / "preview.jpg").exists()
+	# 12 panels: 4 x 3 tiles of 64 x 48
+	assert len(previews) == 12 and previews[-1].shape == (144, 256, 3) and (tmp_path / "preview.jpg").exists()
+	from vfbd3 import preview
+	assert backend.visualize == frozenset(preview.PANELS)
 
 	assert len(backend.calls) == 12
 	assert backend.calls[0] == dict(denoise=1.0, has_feedback=False, shape=(48, 64, 3))
@@ -200,6 +203,42 @@ def test_sdxl_shared_attention_and_correspondence(monkeypatch):
 	backend, _ = output(flow_remap=1.0)
 	corr, spread = backend.correspondence
 	assert corr.shape[2] == 2 and corr.shape[:2] == spread.shape and corr.min() >= 0 and corr.max() <= 8
+	assert backend.attention is None
+
+
+@pytest.mark.slow
+def test_sdxl_attention_previews(monkeypatch):
+	from vfbd3 import common, preview
+	monkeypatch.setattr(common, "load_loras", lambda pipe, specs: None)
+	rng = np.random.default_rng(0)
+	frame_in = rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)
+	previous = rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)
+	noise = rng.standard_normal((4, 8, 8), dtype=np.float32)
+	images = dict(input=frame_in, feedback=previous, previous=previous)
+
+	def output(panels, **settings):
+		cfg = frame.FrameConfig(prompt="a mural", control="canny", steps=4, guidance=1.0, seed=3, **settings)
+		backend = backends.SDXLBackend(cfg, device="cpu", pipe=tiny_sdxl_pipeline())
+		backend.visualize = frozenset(panels)
+		return backend, backend.generate(frame_in, frame_in, 0.75, {}, noise=noise, images=images)
+
+	_, plain = output(())
+	# the correspondence panel adds a reference pass on the input at strength 0: same image, a field to show
+	backend, seen = output(("correspondence", "attention"))
+	assert np.allclose(seen.astype(int), plain.astype(int), atol=1)
+	shares, names = backend.attention
+	assert names == ("self", "input") and backend.correspondence is not None
+	assert shares.shape[2] == 2 and np.allclose(shares.sum(-1), 1, atol=1e-4) and np.allclose(shares[..., 1], 0)
+	# with both references at strength 1 every location gives each of them some attention
+	backend, _ = output(("attention",), reference=1.0, reference_input=1.0)
+	shares, names = backend.attention
+	assert names == ("self", "previous", "input") and backend.correspondence is None
+	assert np.allclose(shares.sum(-1), 1, atol=1e-4) and (shares > 0.01).all()
+	tile = preview.render("attention", preview.Shares(shares, names, seen), (96, 96))
+	assert tile.shape == (96, 96, 3)
+	# no references and no correspondence panel: nothing recorded
+	backend, _ = output(("attention",))
+	assert backend.attention is None and backend.reference is None
 
 
 def tiny_vace_pipeline():

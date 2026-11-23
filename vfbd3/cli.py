@@ -82,7 +82,7 @@ def vace(input_video, output_video, **options):
 @click.option("--reference-adain", type=float, default=None, help="0..1, match feature statistics to the first reference, holding colour and contrast")
 @click.option("--flow-remap", type=float, default=None, help="sdxl, experimental, 0..1: move each output region by the input motion of what it was drawn from (attention correspondence)")
 @click.option("--preview", default=None, help="image file rewritten atomically after every frame, for an auto-refreshing viewer")
-@click.option("--preview-panels", default=None, help="comma-separated: input, control, flow, occlusion, noise, feedback, init, output, confidence, or all (default output)")
+@click.option("--preview-panels", default=None, help="comma-separated: input, control, flow, flow_vectors, occlusion, noise, feedback, init, output, correspondence, confidence, attention, or all (default output)")
 @click.option("--input-filter", default=None, help="filter chain applied to each input frame (see `vfbd3 filters`)")
 @click.option("--feedback-filter", default=None, help="filter chain applied to the motion-compensated previous output")
 @click.option("--control-filter", default=None, help="filter chain applied to the control image")

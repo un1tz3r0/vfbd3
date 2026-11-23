@@ -12,8 +12,10 @@ reference's, which holds colour and contrast.
 
 With `record=True` it also returns where each output location drew from in the last
 reference: the attention-weighted mean key position (a dense correspondence field, as in
-DIFT) and how concentrated that attention was. It is read from the coarsest attention layers
-on the last step, where the field is cheapest and most semantic.
+DIFT) and how concentrated that attention was; and how each location's attention was split
+between the frame's own tokens and each reference's, with the strengths applied. Both are
+read from the coarsest attention layers on the last step, where they are cheapest and most
+semantic.
 """
 
 import math
@@ -31,7 +33,8 @@ class _State:
 		self.record = False
 		self.bank, self.stats, self.i, self.j = [], [], 0, 0
 		self.min_tokens = None
-		self.fields = []        # recorded (mean position, spread) per coarse layer
+		self.fields = []        # recorded attention over the last reference, per coarse layer
+		self.shares = []        # recorded (tokens, 1 + references) attention split, per coarse layer
 
 
 class _SharedAttention:
@@ -55,16 +58,23 @@ class _SharedAttention:
 			hidden_states.new_full((r.shape[1],), s) for r, s in zip(refs, state.log_scales)])
 		mask = bias.view(1, 1, -1).expand(batch, 1, -1)
 		if state.record and n == state.min_tokens:
-			self._record(attn, hidden_states[-1:], refs[-1][-1:])
+			self._record(attn, hidden_states[-1:], [r[-1:] for r in refs])
 		return self.base(attn, hidden_states, context, mask, **kwargs)
 
-	def _record(self, attn, query_states, ref):
-		''' how the (conditional) frame's tokens would attend over the last reference's tokens
-		alone, whatever that reference's strength: a correspondence, not what was injected. '''
-		n, m, heads = query_states.shape[1], ref.shape[1], attn.heads
-		q = attn.to_q(query_states).view(1, n, heads, -1).transpose(1, 2)
-		k = attn.to_k(ref).view(1, m, heads, -1).transpose(1, 2)
-		self.state.fields.append(torch.softmax((q @ k.transpose(-1, -2)).float() * attn.scale, dim=-1).mean(dim=1)[0])
+	def _record(self, attn, query_states, refs):
+		''' for the (conditional) frame's tokens: how they would attend over the last
+		reference's tokens alone, whatever its strength (a correspondence, not what was
+		injected), and how their actual attention divides between themselves and each
+		reference. Both averaged over heads. '''
+		state, heads = self.state, attn.heads
+		split = lambda x: x.view(1, x.shape[1], heads, -1).transpose(1, 2)
+		q = split(attn.to_q(query_states))
+		scores = [(q @ split(attn.to_k(x)).transpose(-1, -2)).float() * attn.scale for x in (query_states, *refs)]
+		state.fields.append(torch.softmax(scores[-1], dim=-1).mean(dim=1)[0])
+		biased = torch.cat([scores[0]] + [s + b for s, b in zip(scores[1:], state.log_scales)], dim=-1)
+		weights = torch.softmax(biased, dim=-1)
+		sizes = [s.shape[-1] for s in scores]
+		state.shares.append(torch.stack([w.sum(-1) for w in weights.split(sizes, dim=-1)], -1).mean(dim=1)[0])
 
 
 class Reference:
@@ -101,7 +111,9 @@ class Reference:
 		''' context manager. `references`: [(latents, strength), ...]. While inside, every UNet
 		call is preceded by a reference pass with those latents noised by `noise` to the current
 		timestep. With `record`, the correspondence to the last reference is gathered on the
-		final UNet call; read it from `.correspondence` afterwards. '''
+		final UNet call; read `.correspondence` (see `_field`) and `.shares` ((h, w, 1 + number
+		of references): the share of attention on the frame itself, then on each reference, on
+		the coarse token grid) afterwards. '''
 		unet, state = self.unet, self.state
 		original = unet.forward
 		patched = "forward" in vars(unet)   # accelerate's offload hooks patch forward per instance
@@ -134,8 +146,8 @@ class Reference:
 		class Active:
 			def __enter__(self):
 				state.log_scales = [math.log(s) if s > 0 else -math.inf for _, s in references]
-				state.adain, state.fields = adain, []
-				outer.correspondence = None
+				state.adain, state.fields, state.shares = adain, [], []
+				outer.correspondence = outer.shares = None
 				unet.forward = forward
 
 			def __exit__(self, *exc):
@@ -146,21 +158,28 @@ class Reference:
 				state.bank.clear(), state.stats.clear()
 				if state.fields:
 					outer.correspondence = outer._field(torch.stack(state.fields).mean(0), latents.shape[-2:])
-				state.fields, state.record = [], False
+					shares = torch.stack(state.shares).mean(0)
+					h, w, _ = outer._grid(shares.shape[0], latents.shape[-2:])
+					outer.shares = shares.reshape(h, w, -1).cpu().numpy()
+				state.fields, state.shares, state.record = [], [], False
 
 		return Active()
+
+	@staticmethod
+	def _grid(n, latent_hw):
+		''' (h, w, latent pixels per token) of a layer with `n` tokens. '''
+		lh, lw = latent_hw
+		f = math.sqrt(lh * lw / n)
+		h, w = round(lh / f), round(lw / f)
+		return h, w, lw / w
 
 	@staticmethod
 	def _field(weights, latent_hw):
 		''' (queries, keys) attention -> (h, w, 2) mean key position and (h, w) spread, in
 		latent-pixel units, on the coarse token grid. '''
-		n = weights.shape[0]
-		lh, lw = latent_hw
-		f = math.sqrt(lh * lw / n)
-		h, w = round(lh / f), round(lw / f)
+		h, w, scale = Reference._grid(weights.shape[0], latent_hw)
 		ys, xs = torch.meshgrid(torch.arange(h, device=weights.device), torch.arange(w, device=weights.device), indexing="ij")
 		pos = torch.stack([xs, ys], -1).reshape(-1, 2).float()
 		mean = weights @ pos
 		spread = (weights * ((pos[None] - mean[:, None]) ** 2).sum(-1)).sum(-1).sqrt()
-		scale = lw / w
 		return ((mean.reshape(h, w, 2) + 0.5) * scale).cpu().numpy(), (spread.reshape(h, w) * scale).cpu().numpy()

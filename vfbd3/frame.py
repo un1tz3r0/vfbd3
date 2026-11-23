@@ -77,6 +77,11 @@ class FrameConfig:
 			raise ValueError(f"noise must be warp, fixed or random, got {self.noise!r}")
 
 
+def confidence(correspondence, scale):
+	''' 0..1 per coarse token: high where attention was concentrated within about one token. '''
+	return np.exp(-(correspondence[1] * scale / 64.0) ** 2)
+
+
 def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=None, on_preview=None):
 	''' restyle `input_path` into `output_path`.
 
@@ -92,6 +97,7 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 
 	show = previews.Preview(cfg.preview, cfg.preview_panels, on_preview)
 	backend = backend or backends.create(cfg)
+	backend.visualize = frozenset(show.names) if show.active else frozenset()
 	control_fn = control_fn or controls.create_control(cfg.control)
 	compensate = motion.MotionCompensator(cfg.motion_estimator, cfg.motion_alpha, cfg.motion_sigma, cfg.occlusion)
 	scale = getattr(backend, "latent_scale", 8)
@@ -125,9 +131,7 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 			correspondence = getattr(backend, "correspondence", None)
 			remap = None
 			if cfg.flow_remap > 0 and correspondence is not None:
-				corr, spread = correspondence
-				# confident where attention was concentrated within about one coarse token
-				remap = (corr * scale, cfg.flow_remap * np.exp(-(spread * scale / 64.0) ** 2))
+				remap = (correspondence[0] * scale, cfg.flow_remap * confidence(correspondence, scale))
 			feedback, occluded = compensate(prev_input, frame, prev_output, remap=remap)
 			if cfg.noise == "warp":
 				field.advance(compensate.output_flow, occluded)
@@ -155,10 +159,17 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 		work.save(index, output)
 		work.commit(index + 1)
 		if show.active:
+			flow = compensate.output_flow if feedback is not None else None
 			correspondence = getattr(backend, "correspondence", None)
-			show(input=frame, control=control, flow=compensate.output_flow if feedback is not None else None,
-				occlusion=regen, noise=noise, feedback=feedback, init=init, output=output,
-				confidence=np.exp(-(correspondence[1] * scale / 64.0) ** 2) if correspondence else None)
+			conf = confidence(correspondence, scale) if correspondence else None
+			attention = getattr(backend, "attention", None)
+			show(input=frame, control=control, flow=flow, occlusion=regen, noise=noise, feedback=feedback, init=init, output=output,
+				# the motion the previous output was carried by, over the two input frames it was estimated from
+				flow_vectors=previews.Vectors.from_flow(prev_input, frame, flow) if flow is not None else None,
+				# where each part of this output was drawn from in this input frame
+				correspondence=previews.Vectors(frame, output, correspondence[0] * scale, conf) if correspondence else None,
+				confidence=conf,
+				attention=previews.Shares(*attention, output) if attention else None)
 		prev_input, prev_output = frame, output
 
 	return common.finish(work, output_path, fps, audio_from=input_path if info.has_audio else None,

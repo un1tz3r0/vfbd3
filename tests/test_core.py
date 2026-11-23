@@ -180,3 +180,27 @@ def test_preview_writes_atomically_and_tiles(tmp_path):
 	assert cv2.imread(str(path)).shape == (48, 64, 3)
 	with pytest.raises(ValueError):
 		preview.Preview(str(path), "output,bogus")
+
+
+def test_preview_vectors_and_shares():
+	from vfbd3 import preview
+	rng = np.random.default_rng(0)
+	source, dest = (rng.integers(0, 255, (48, 64, 3), dtype=np.uint8) for _ in range(2))
+	blend = cv2.addWeighted(cv2.resize(source, (128, 96), interpolation=cv2.INTER_AREA), 0.5,
+		cv2.resize(dest, (128, 96), interpolation=cv2.INTER_AREA), 0.5, 0)
+	# dense flow: every dest pixel came from 4 px to its left, so arrows point right
+	flow = np.zeros((48, 64, 2), np.float32)
+	flow[..., 0] = -4
+	field = preview.Vectors.from_flow(source, dest, flow)
+	assert np.allclose(field.start[10, 20], (16.5, 10.5))
+	tile = preview.render("flow_vectors", field, (128, 96))
+	assert tile.shape == (96, 128, 3) and (tile != blend).any()
+	# coarse field (a 3 x 4 grid) staying in place: dots, and weight 0 still draws them dimmed
+	ys, xs = np.mgrid[0:3, 0:4]
+	still = np.stack([(xs + 0.5) * 16, (ys + 0.5) * 16], -1).astype(np.float32)
+	tile = preview.render("correspondence", preview.Vectors(source, dest, still, np.zeros((3, 4))), (128, 96))
+	assert (tile != blend).any()
+	shares = np.zeros((3, 4, 3), np.float32)
+	shares[..., 2] = 1
+	tile = preview.render("attention", preview.Shares(shares, ("self", "previous", "input")), (128, 96))
+	assert tuple(tile[48, 64]) == preview.SHARE_COLORS["input"]
