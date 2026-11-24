@@ -97,6 +97,7 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 
 	show = previews.Preview(cfg.preview, cfg.preview_panels, on_preview)
 	backend = backend or backends.create(cfg)
+	backend.visualize = frozenset(show.names) if show.active else frozenset()
 	control_fn = control_fn or controls.create_control(cfg.control)
 	compensate = motion.MotionCompensator(cfg.motion_estimator, cfg.motion_alpha, cfg.motion_sigma, cfg.occlusion)
 	scale = getattr(backend, "latent_scale", 8)
@@ -164,10 +165,14 @@ def run(input_path, output_path, cfg, backend=None, control_fn=None, on_frame=No
 			corr = None if corr is None else corr * scale
 			conf = None if spread is None else confidence(spread, scale)
 			flow = compensate.output_flow if feedback is not None else None
+			attention = getattr(backend, "attention", None)
 			show(input=frame, control=control, flow=flow, vectors=None if flow is None else (prev_input, flow),
+				flow_vectors=previews.Vectors.from_flow(prev_input, frame, flow) if flow is not None else None,
 				occlusion=regen, noise=noise, reference=prev_output, warped=warped, feedback=feedback, init=init,
 				output=output, attention=None if corr is None else (frame, corr, conf),
-				attended=None if corr is None else (frame, corr), confidence=conf)
+				attended=None if corr is None else (frame, corr),
+				correspondence=previews.Vectors(frame, output, corr, conf) if corr is not None else None,
+				confidence=conf, attention_split=previews.Shares(*attention, output) if attention else None)
 		prev_input, prev_output = frame, output
 
 	return common.finish(work, output_path, fps, audio_from=input_path if info.has_audio else None,

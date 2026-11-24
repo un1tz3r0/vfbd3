@@ -67,6 +67,7 @@ class Backend:
 
 	latent_channels = 4
 	offloaded = False
+	visualize = frozenset()   # preview panels being shown; backends may record extra data for some
 
 	def __init__(self, cfg, device=None, pipe=None):
 		import torch
@@ -205,12 +206,8 @@ class SDXLBackend(Backend):
 		cfg, pipe = self.cfg, self.pipe
 		if cfg.ip_adapter > 0:
 			pipe.load_ip_adapter("h94/IP-Adapter", subfolder="sdxl_models", weight_name="ip-adapter_sdxl.bin")
-		self.reference, self.correspondence = None, None
-		# record the attention correspondence for flow remap, or just to show it in the preview
-		self.record = cfg.flow_remap > 0 or bool(set(previews.ATTENTION) & set(previews.parse(cfg.preview_panels)))
-		if cfg.reference > 0 or cfg.reference_input > 0 or self.record:
-			from .reference import Reference
-			self.reference = Reference(pipe.unet)
+		# installed on first use: the reference preview panels can call for it too
+		self.reference, self.correspondence, self.attention = None, None, None
 		if device.startswith("cuda") and common.cuda_vram_gb() < 14:
 			pipe.enable_model_cpu_offload()
 			self.offloaded = True
@@ -236,16 +233,23 @@ class SDXLBackend(Backend):
 	def mix(self, clean, noise, t):
 		return self.pipe.scheduler.add_noise(clean, noise, t.reshape(1))
 
+	@property
+	def wants_correspondence(self):
+		return self.cfg.flow_remap > 0 or bool(self.visualize & set(previews.ATTENTION))
+
 	def references(self, params, images):
-		''' [(latents, strength)] for shared attention: the previous output first (it also
-		drives AdaIN), the current input last (it also gives the flow-remap correspondence). '''
-		cfg, refs = self.cfg, []
+		''' ([(latents, strength)], [name]) for shared attention: the previous output first (it
+		also drives AdaIN), the current input last (it also gives the correspondence, for flow
+		remap and the preview, which add it even at strength 0). '''
+		cfg, refs, names = self.cfg, [], []
 		previous = images.get("feedback" if cfg.reference_warp else "previous")
 		if cfg.reference > 0 and previous is not None:
 			refs.append((self.encode(previous), params.get("reference", cfg.reference)))
-		if (cfg.reference_input > 0 or self.record) and images.get("input") is not None:
+			names.append("previous")
+		if (cfg.reference_input > 0 or self.wants_correspondence) and images.get("input") is not None:
 			refs.append((self.encode(images["input"]), params.get("reference_input", cfg.reference_input)))
-		return refs
+			names.append("input")
+		return refs, names
 
 	def call(self, kwargs, init, control, params, images):
 		import contextlib
@@ -254,14 +258,20 @@ class SDXLBackend(Backend):
 			pipe.set_ip_adapter_scale(params.get("ip_adapter", cfg.ip_adapter))
 			kwargs["ip_adapter_image"] = Image.fromarray(images.get("feedback") if images.get("feedback") is not None else init)
 		active = contextlib.nullcontext()
-		refs = self.references(params, images) if self.reference is not None else []
+		refs, names = self.references(params, images)
+		correspond, shares = self.wants_correspondence and names[-1:] == ["input"], "attention_split" in self.visualize
 		if refs:
+			if self.reference is None:
+				from .reference import Reference
+				self.reference = Reference(pipe.unet)
 			active = self.reference.active(pipe.scheduler, refs, self.noise, adain=cfg.reference_adain,
-				record=self.record, steps=self.steps_run)
+				record=correspond or shares, steps=self.steps_run)
 		with active:
 			image = pipe(**kwargs, image=Image.fromarray(init), control_image=[Image.fromarray(control)],
 				control_mode=[SDXL_UNION_MODES[self.family]]).images[0]
-		self.correspondence = getattr(self.reference, "correspondence", None) if refs else None
+		self.correspondence = self.reference.correspondence if refs and correspond else None
+		# (h, w, 1 + references) attention split, and what each share is of
+		self.attention = (self.reference.shares, ("self", *names)) if refs and shares else None
 		return image
 
 

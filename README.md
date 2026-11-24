@@ -98,27 +98,32 @@ attention level (1/32 of the frame) and falls back to plain flow where attention
 
 `--preview FILE` rewrites FILE after every frame, writing a temporary file and renaming it
 over the old one so a viewer never sees a partial image. `--preview-panels` makes it a
-labelled mosaic of these panels (or `all`). In Python, `frame.run(..., on_preview=fn)`
+labelled mosaic of any of these (or `all`). In Python, `frame.run(..., on_preview=fn)`
 receives each image.
 
-- `input`, `control`, `init`, `output`: the frame, its control image, what was denoised, the result.
-- `flow`: the motion the previous output was moved by (hue: direction, brightness: speed).
-- `vectors`: the same motion averaged over 32 px cells and drawn as arrows over the previous
-  input frame, pointing the way content travels. Hue follows direction; brightness, width and
-  head size follow speed. Arrows are scaled so the fastest spans a cell; the corner shows its speed.
-- `occlusion`, `noise`: the regenerated (disoccluded) mask and the starting latent noise.
-- `reference`, `warped`, `feedback`: the previous output as it was, carried along the motion,
-  and with disoccluded areas filled from the input (what feeds the next frame).
-- `attention` (sdxl): one arrow per coarsest-level attention token (1/32 of the frame), from
-  where in the input it drew from to where it is in the output, over the input frame. Arrows
-  are shortened and greyed by confidence, as `--flow-remap` discounts them: where attention
-  was diffuse it falls back to plain flow.
-- `attended` (sdxl): the input resampled through that correspondence, i.e. what each part of
-  the output was drawn from. `confidence`: how concentrated that attention was.
+| panel | shows |
+|---|---|
+| `input`, `control`, `feedback`, `init`, `output` | the images of the loop |
+| `flow` | the motion the previous output was moved by, as colour (hue: direction, brightness: speed) |
+| `vectors` | the same motion averaged over 32 px cells, with arrows over the previous input, scaled to fit a cell |
+| `flow_vectors` | the same motion as a grid of arrows over the previous and current input, blended 50/50 |
+| `occlusion` | newly revealed areas, generated anew |
+| `noise` | the starting noise (first three latent channels) |
+| `reference`, `warped` | the previous output before and after motion compensation |
+| `attention` | sdxl: correspondence arrows over the input, shortened and greyed by confidence |
+| `attended` | sdxl: the input resampled through the correspondence |
+| `correspondence` | sdxl: where each part of the output was drawn from in the input, as arrows over the two blended |
+| `confidence` | sdxl: how concentrated that attention was (white: within about one token) |
+| `attention_split` | sdxl: how attention divides between the frame itself (blue), the previous output (orange) and the input (green), with the mean shares |
 
-The attention panels need the correspondence recorded, which takes a reference pass with the
-input (at strength 0 unless `--reference-input` is set); asking for them adds that pass even
-without `--flow-remap`, so they cost roughly one extra UNet pass per step.
+An arrow starts where a point was in the first image and ends where it is in the second, so
+where the motion is right its head lands on the matching feature. Arrow colour is direction,
+on the same wheel as `flow`; dim arrows in `correspondence` are low confidence. The
+sdxl panels come from the coarsest attention level (1/32 of the frame) on the last step.
+`attention_split` needs `--reference` or `--reference-input`; `attention`, `attended`,
+`correspondence` and `confidence` add a reference pass on the input even without them
+(at strength 0, so the output is unchanged, but it costs one extra UNet pass per step,
+as `--flow-remap` does).
 
 ### Colour creep
 
