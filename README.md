@@ -105,20 +105,25 @@ receives each image.
 |---|---|
 | `input`, `control`, `feedback`, `init`, `output` | the images of the loop |
 | `flow` | the motion the previous output was moved by, as colour (hue: direction, brightness: speed) |
+| `vectors` | the same motion averaged over 32 px cells, with arrows over the previous input, scaled to fit a cell |
 | `flow_vectors` | the same motion as a grid of arrows over the previous and current input, blended 50/50 |
 | `occlusion` | newly revealed areas, generated anew |
 | `noise` | the starting noise (first three latent channels) |
+| `reference`, `warped` | the previous output before and after motion compensation |
+| `attention` | sdxl: correspondence arrows over the input, shortened and greyed by confidence |
+| `attended` | sdxl: the input resampled through the correspondence |
 | `correspondence` | sdxl: where each part of the output was drawn from in the input, as arrows over the two blended |
 | `confidence` | sdxl: how concentrated that attention was (white: within about one token) |
-| `attention` | sdxl: how attention divides between the frame itself (blue), the previous output (orange) and the input (green), with the mean shares |
+| `attention_split` | sdxl: how attention divides between the frame itself (blue), the previous output (orange) and the input (green), with the mean shares |
 
 An arrow starts where a point was in the first image and ends where it is in the second, so
 where the motion is right its head lands on the matching feature. Arrow colour is direction,
-on the same wheel as `flow`; dim arrows in `correspondence` are low confidence. The three
+on the same wheel as `flow`; dim arrows in `correspondence` are low confidence. The
 sdxl panels come from the coarsest attention level (1/32 of the frame) on the last step.
-`attention` needs `--reference` or `--reference-input`; `correspondence` and `confidence` add
-a reference pass on the input even without them (at strength 0, so the output is unchanged,
-but it costs one extra UNet pass per step, as `--flow-remap` does).
+`attention_split` needs `--reference` or `--reference-input`; `attention`, `attended`,
+`correspondence` and `confidence` add a reference pass on the input even without them
+(at strength 0, so the output is unchanged, but it costs one extra UNet pass per step,
+as `--flow-remap` does).
 
 ### Colour creep
 

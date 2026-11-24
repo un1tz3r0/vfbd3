@@ -18,6 +18,23 @@ class RecordingBackend:
 		return np.clip(init.astype(int) + 10, 0, 255).astype(np.uint8)
 
 
+@pytest.mark.parametrize("panel", ["attention", "attended", "correspondence", "confidence"])
+def test_correspondence_panels_request_input_reference(panel):
+	backend = object.__new__(backends.SDXLBackend)
+	backend.cfg = frame.FrameConfig(prompt="x")
+	backend.visualize = frozenset([panel])
+	backend.encode = lambda image: image
+	refs, names = backend.references({}, {"input": "frame"})
+	assert names == ["input"] and refs == [("frame", 0)]
+
+
+def test_attention_split_alone_does_not_request_input_reference():
+	backend = object.__new__(backends.SDXLBackend)
+	backend.cfg = frame.FrameConfig(prompt="x")
+	backend.visualize = frozenset(["attention_split"])
+	assert backend.references({}, {"input": "frame"}) == ([], [])
+
+
 def test_frame_engine_runs_and_resumes(clip, tmp_path):
 	out = tmp_path / "out.mp4"
 	cfg = frame.FrameConfig(prompt="x", control="canny", short_side=48, max_area=64 * 48, duration=1.0,
@@ -26,8 +43,8 @@ def test_frame_engine_runs_and_resumes(clip, tmp_path):
 	backend = RecordingBackend()
 	previews = []
 	frame.run(clip, out, cfg, backend=backend, on_frame=lambda i, t: {"denoise": 0.3} if i == 5 else None, on_preview=previews.append)
-	# 12 panels: 4 x 3 tiles of 64 x 48
-	assert len(previews) == 12 and previews[-1].shape == (144, 256, 3) and (tmp_path / "preview.jpg").exists()
+	# 17 panels: 5 x 4 tiles of 64 x 48
+	assert len(previews) == 12 and previews[-1].shape == (192, 320, 3) and (tmp_path / "preview.jpg").exists()
 	from vfbd3 import preview
 	assert backend.visualize == frozenset(preview.PANELS)
 
@@ -224,20 +241,20 @@ def test_sdxl_attention_previews(monkeypatch):
 
 	_, plain = output(())
 	# the correspondence panel adds a reference pass on the input at strength 0: same image, a field to show
-	backend, seen = output(("correspondence", "attention"))
+	backend, seen = output(("correspondence", "attention_split"))
 	assert np.allclose(seen.astype(int), plain.astype(int), atol=1)
 	shares, names = backend.attention
 	assert names == ("self", "input") and backend.correspondence is not None
 	assert shares.shape[2] == 2 and np.allclose(shares.sum(-1), 1, atol=1e-4) and np.allclose(shares[..., 1], 0)
 	# with both references at strength 1 every location gives each of them some attention
-	backend, _ = output(("attention",), reference=1.0, reference_input=1.0)
+	backend, _ = output(("attention_split",), reference=1.0, reference_input=1.0)
 	shares, names = backend.attention
 	assert names == ("self", "previous", "input") and backend.correspondence is None
 	assert np.allclose(shares.sum(-1), 1, atol=1e-4) and (shares > 0.01).all()
-	tile = preview.render("attention", preview.Shares(shares, names, seen), (96, 96))
+	tile = preview.render("attention_split", preview.Shares(shares, names, seen), (96, 96))
 	assert tile.shape == (96, 96, 3)
 	# no references and no correspondence panel: nothing recorded
-	backend, _ = output(("attention",))
+	backend, _ = output(("attention_split",))
 	assert backend.attention is None and backend.reference is None
 
 

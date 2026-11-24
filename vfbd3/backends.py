@@ -19,7 +19,7 @@ import inspect
 import numpy as np
 from PIL import Image
 
-from . import common, control as controls
+from . import common, control as controls, preview as previews
 
 # ControlNet-Union (xinsir, SDXL) mode per control family
 SDXL_UNION_MODES = {"pose": 0, "depth": 1, "softedge": 2, "lines": 3, "normal": 4}
@@ -235,7 +235,7 @@ class SDXLBackend(Backend):
 
 	@property
 	def wants_correspondence(self):
-		return self.cfg.flow_remap > 0 or bool(self.visualize & {"correspondence", "confidence"})
+		return self.cfg.flow_remap > 0 or bool(self.visualize & set(previews.ATTENTION))
 
 	def references(self, params, images):
 		''' ([(latents, strength)], [name]) for shared attention: the previous output first (it
@@ -259,7 +259,7 @@ class SDXLBackend(Backend):
 			kwargs["ip_adapter_image"] = Image.fromarray(images.get("feedback") if images.get("feedback") is not None else init)
 		active = contextlib.nullcontext()
 		refs, names = self.references(params, images)
-		correspond, shares = self.wants_correspondence and names[-1:] == ["input"], "attention" in self.visualize
+		correspond, shares = self.wants_correspondence and names[-1:] == ["input"], "attention_split" in self.visualize
 		if refs:
 			if self.reference is None:
 				from .reference import Reference
