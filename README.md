@@ -101,6 +101,11 @@ over the old one so a viewer never sees a partial image. `--preview-panels` make
 labelled mosaic of any of these (or `all`). In Python, `frame.run(..., on_preview=fn)`
 receives each image.
 
+Panels are normalised per frame so faint signals stay visible: flow, noise and masks such as
+`confidence` are stretched to their own min..max, and arrow panels magnify small offsets until
+the longest reaches about one arrow spacing (`vectors` also shrinks large ones). A ramp in the
+lower-right corner gives the range shown and the arrow gain, e.g. `0..2.47px x11`.
+
 | panel | shows |
 |---|---|
 | `input`, `control`, `feedback`, `init`, `output` | the images of the loop |

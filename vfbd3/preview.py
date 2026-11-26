@@ -64,6 +64,28 @@ def _label(image, lines, origin, size):
 		y += int(22 * size) + 4
 
 
+def legend(image, lo, hi, unit="", gain=1.0):
+	''' a small grey ramp in the lower-right corner, labelled with the range the panel was
+	stretched over and, for arrows, how much they were magnified (or shrunk) to show it. '''
+	h, w = image.shape[:2]
+	bw, bh = max(24, w // 6), max(3, h // 60)
+	x1, y1 = w - 6, h - 6
+	x0, y0 = x1 - bw, y1 - bh
+	image[y0:y1, x0:x1] = np.linspace(0, 255, bw).astype(np.uint8)[None, :, None]
+	cv2.rectangle(image, (x0 - 1, y0 - 1), (x1, y1), (0, 0, 0), 1)
+	text = f"{lo:.3g}..{hi:.3g}{unit}" + (f" x{gain:.2g}" if abs(gain - 1) > 0.01 else "")
+	size = min(0.45, max(0.3, w / 900))
+	(tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, size, 1)
+	_label(image, [(text, (255, 255, 255))], (x1 - tw, y0 - 5), size)
+	return image
+
+
+def stretch(value):
+	''' (value min-max normalised to 0..1, min, max); a flat value is only clipped. '''
+	lo, hi = float(value.min()), float(value.max())
+	return ((value - lo) / (hi - lo) if hi - lo > 1e-6 else np.clip(value, 0, 1)), lo, hi
+
+
 def draw_vectors(value, size, spacing=24):
 	''' source and dest blended 50/50 at `size` (w, h), with arrows at least `spacing` pixels
 	apart: one per grid cell when the grid is coarse, sampled when it is dense. '''
@@ -80,6 +102,11 @@ def draw_vectors(value, size, spacing=24):
 	end = np.stack([ex, ey], -1).reshape(-1, 2)
 	weight = np.ones(len(end)) if value.weight is None else np.clip(value.weight[np.ix_(rows, cols)].reshape(-1), 0, 1)
 	d = (end - start).astype(np.float32)
+	# magnify small offsets so the longest (99th percentile) reaches most of an arrow spacing
+	top = float(np.percentile(np.hypot(d[:, 0], d[:, 1]), 99)) if len(d) else 0.0
+	gain = max(1.0, 0.8 * stride * min(tw / gw, th / gh) / top) if top > 1e-3 else 1.0
+	d *= gain
+	start = end - d
 	hsv = np.zeros((1, len(d), 3), np.uint8)
 	hsv[0, :, 0] = (np.arctan2(d[:, 1], d[:, 0]) % (2 * np.pi)) * 90 / np.pi
 	hsv[0, :, 1:] = 255
@@ -91,7 +118,7 @@ def draw_vectors(value, size, spacing=24):
 				cv2.circle(image, b, max(1, t // 2 + 1), c, -1, cv2.LINE_AA)
 			else:
 				cv2.arrowedLine(image, a, b, c, t, cv2.LINE_AA, tipLength=min(0.4, 5 / length))
-	return image
+	return legend(image, 0, top * sw / tw, "px", gain)
 
 
 def draw_shares(value, size):
@@ -127,12 +154,12 @@ def write_atomic(path, image):
 		tmp.unlink(missing_ok=True)
 
 
-def quiver(background, tails, vectors, size, fit=None, saturation=None):
+def quiver(background, tails, vectors, size, fit, shrink=True, at_head=False, saturation=None):
 	''' arrows from `tails` along `vectors` ((n, 2), pixels of `background`) over the dimmed
-	background, drawn at `size` (w, h). Hue follows arrow direction;
-	brightness, width and head size follow length relative to the longest (99th percentile).
-	`fit`: rescale so that length is `fit` pixels, else true length. `saturation`: (n,) 0..1,
-	low values draw grey and dimmer. '''
+	background, drawn at `size` (w, h). Hue follows arrow direction; brightness, width and head
+	size follow length relative to the longest (99th percentile), which is scaled to `fit`
+	pixels (only ever up, unless `shrink`). `at_head`: scale about the arrow heads instead of
+	the tails. `saturation`: (n,) 0..1, low values draw grey and dimmer. '''
 	h, w = background.shape[:2]
 	k = np.array([size[0] / w, size[1] / h])
 	image = (cv2.resize(background, size, interpolation=cv2.INTER_AREA) * 0.4).astype(np.uint8)
@@ -143,16 +170,16 @@ def quiver(background, tails, vectors, size, fit=None, saturation=None):
 	sat = 1.0 if saturation is None else np.clip(saturation, 0, 1)
 	hsv = np.stack(np.broadcast_arrays(hue, 255 * sat, (70 + 185 * m) * (0.4 + 0.6 * sat)), -1).astype(np.uint8)
 	colors = cv2.cvtColor(hsv[None], cv2.COLOR_HSV2RGB)[0].tolist()
-	tails, heads = tails * k * 16, (tails + vectors * (fit / top if fit else 1.0)) * k * 16   # 4 bits subpixel
+	gain = fit / top if shrink else max(1.0, fit / top)
+	if at_head:
+		tails = tails + vectors * (1 - gain)
+	tails, heads = tails * k * 16, (tails + vectors * gain) * k * 16   # 4 bits subpixel
 	for p, q, mi, color in zip(np.rint(tails).astype(int).tolist(), np.rint(heads).astype(int).tolist(), m, colors):
 		if np.hypot(q[0] - p[0], q[1] - p[1]) < 32:
 			cv2.circle(image, p, 16, color, -1, cv2.LINE_AA, shift=4)
 		else:
 			cv2.arrowedLine(image, p, q, color, 1 + round(2 * mi), cv2.LINE_AA, shift=4, tipLength=0.2 + 0.2 * mi)
-	label = f"{top:.1f}px" if fit else f"max {top:.0f}px"
-	for color, weight in (((0, 0, 0), 3), ((255, 255, 255), 1)):
-		cv2.putText(image, label, (6, size[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, weight, cv2.LINE_AA)
-	return image
+	return legend(image, 0, top, "px", gain)
 
 
 def grid_centres(h, w, gh, gw):
@@ -172,16 +199,20 @@ def flow_vectors(background, flow, size, grid=32):
 def attention_vectors(background, correspondence, confidence, size):
 	''' one arrow per coarse attention token, from where in `background` it drew from to the
 	token itself, shortened and greyed by confidence the way flow remap discounts it (falling back
-	to plain flow where attention was diffuse). '''
+	to plain flow where attention was diffuse), and magnified when the offsets are small. '''
 	h, w = background.shape[:2]
+	gh, gw = correspondence.shape[:2]
 	conf = confidence.reshape(-1, 1)
-	heads = grid_centres(h, w, *correspondence.shape[:2])
+	heads = grid_centres(h, w, gh, gw)
 	vectors = (heads - correspondence.reshape(-1, 2)) * conf
-	return quiver(background, heads - vectors, vectors, size, saturation=conf[:, 0])
+	return quiver(background, heads - vectors, vectors, size, fit=0.9 * min(h / gh, w / gw),
+		shrink=False, at_head=True, saturation=conf[:, 0])
 
 
 def render(name, value, size):
-	''' turn one intermediate into an RGB uint8 image of `size` (w, h). '''
+	''' turn one intermediate into an RGB uint8 image of `size` (w, h). Flow, noise and masks
+	are stretched to their own range each frame, shown by a legend in the corner. '''
+	scale = None
 	if value is None:
 		image = np.zeros((size[1], size[0], 3), np.uint8)
 	elif isinstance(value, Vectors):
@@ -198,17 +229,21 @@ def render(name, value, size):
 		corr = cv2.resize(correspondence.astype(np.float32), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
 		image = cv2.remap(frame, corr[..., 0] - 0.5, corr[..., 1] - 0.5, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 	elif name == "flow":
-		image = motion.flow_to_image(value)
+		image = motion.flow_to_image(value)   # brightness is already min-max of the magnitude
+		magnitude = np.hypot(value[..., 0], value[..., 1])
+		scale = (float(magnitude.min()), float(magnitude.max()), "px")
 	elif name == "noise":
-		# first three latent channels as colour, +-2 sigma mapped to 0..255
-		image = np.clip(value[:3].transpose(1, 2, 0) * 64 + 128, 0, 255).astype(np.uint8)
+		# first three latent channels as colour
+		image, lo, hi = stretch(value[:3].transpose(1, 2, 0))
+		image, scale = (image * 255).astype(np.uint8), (lo, hi, "sd")
 	elif value.ndim == 2:
-		image = np.repeat((np.clip(value, 0, 1) * 255).astype(np.uint8)[..., None], 3, axis=2)
+		image, lo, hi = stretch(value.astype(np.float32))
+		image, scale = np.repeat((image * 255).astype(np.uint8)[..., None], 3, axis=2), (lo, hi, "")
 	else:
 		image = value
 	if image.shape[:2] != (size[1], size[0]):
 		image = cv2.resize(image, size, interpolation=cv2.INTER_NEAREST if name == "noise" else cv2.INTER_AREA)
-	return image
+	return image if scale is None else legend(np.ascontiguousarray(image), *scale)
 
 
 def mosaic(panels, names, max_width=1920):
