@@ -3,6 +3,8 @@
 Restyle video with diffusion models. Successor to
 [controlnetvideo](https://github.com/un1tz3r0/controlnetvideo), built to run on a Colab T4.
 
+![screenshot](download.png)
+
 Two engines, same inputs and outputs:
 
 | | `vace` | `frame` |
